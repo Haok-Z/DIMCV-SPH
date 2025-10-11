@@ -1,11 +1,11 @@
 import taichi as ti
-from dimc_sph import DIMCSPHSolver
+from dimcv_sph import DIMCVSPHSolver
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 
 
-class KarmanVortexSolver(DIMCSPHSolver):
+class KarmanVortexSolver(DIMCVSPHSolver):
 
     def __init__(self, particle_system):
         super().__init__(particle_system)
@@ -101,7 +101,7 @@ class KarmanVortexSolver(DIMCSPHSolver):
         self.compute_DFSPH_factor()
         self.divergence_solve()
         self.compute_non_pressure_forces()
-        self.dimc()
+        self.dimcv()
         self.predict_velocity()
         self.pressure_solve()
         self.copy_x_temp()

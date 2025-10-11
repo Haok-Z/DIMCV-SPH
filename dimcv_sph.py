@@ -4,7 +4,7 @@ import numpy as np
 
 
 @ti.data_oriented
-class DIMCSPHSolver(SPHBase):
+class DIMCVSPHSolver(SPHBase):
 
     def __init__(self, particle_system):
         super().__init__(particle_system)
@@ -809,7 +809,7 @@ class DIMCSPHSolver(SPHBase):
         self.compute_kinematic_vorticity_num_sample()
         self.record_vort_part_sample_idx()
 
-    def dimc(self):
+    def dimcv(self):
         self.init()
         self.compute_d_vorticity()
         self.compute_all_d_vort_smoothed()
