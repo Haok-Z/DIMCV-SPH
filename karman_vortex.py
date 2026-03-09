@@ -9,10 +9,10 @@ class KarmanVortexSolver(DIMCVSPHSolver):
 
     def __init__(self, particle_system):
         super().__init__(particle_system)
-        self.circle_pos = ti.Vector([0.4, 0.5])
+        self.circle_pos = ti.Vector([0.4, 0.5, 0.5])
         self.circle_vis = ti.Vector.field(self.ps.dim, dtype=float, shape=1)
         self.circle_vis[0] = ti.Vector(
-            [self.circle_pos[0] * 0.25, self.circle_pos[1]])
+            [self.circle_pos[0] * 0.25, self.circle_pos[1], self.circle_pos[2]])
         self.circle_radius = 0.1
         self.init_circle()
 
@@ -22,7 +22,7 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             if self.ps.object_id[p] == 2:
                 if (self.ps.x[p] -
                         self.circle_pos).norm() > self.circle_radius:
-                    self.ps.x[p] = ti.Vector([0, 0])
+                    self.ps.x[p] = ti.Vector([0, 0, 0])
                     self.ps.is_active[p] = 0
 
     def export_png(self, cnt, image_path):
@@ -39,7 +39,33 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         fluid_vort = vort[fluid_mask]
         solid_x = x[solid_mask]
 
-        fluid_x_x = fluid_x[:, 0]
+        fig = plt.figure(figsize=(10, 4), dpi=200)
+        ax = fig.add_subplot(111, projection='3d')
+        ax.view_init(elev=30, azim=-60)
+        sc = ax.scatter(fluid_x[:, 0],
+                        fluid_x[:, 1],
+                        fluid_x[:, 2],
+                        c=fluid_vort,
+                        cmap='coolwarm',
+                        s=0.2,  # 3D 模式下粒子尺寸建议调小
+                        norm=Normalize(vmin=-40, vmax=40),
+                        edgecolors='none',
+                        alpha=0.6)
+        ax.scatter(solid_x[:, 0],
+                   solid_x[:, 1],
+                   solid_x[:, 2],
+                   color="#00C853",
+                   s=0.5,
+                   edgecolors='none')
+
+        ax.set_xlim(0, 4)
+        ax.set_ylim(0, 1)
+        ax.set_zlim(0, 1)
+        ax.set_box_aspect((4, 1, 1))
+        ax.set_axis_off()  # 如果想看坐标轴可以注释掉这一行
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+        '''fluid_x_x = fluid_x[:, 0]
         fluid_x_y = fluid_x[:, 1]
         solid_x_x = solid_x[:, 0]
         solid_x_y = solid_x[:, 1]
@@ -72,10 +98,12 @@ class KarmanVortexSolver(DIMCVSPHSolver):
 
         plt.xlim(0, 4)
         plt.ylim(0, 1)
+        '''
 
         plt.savefig(image_path / f"vorticity_{cnt:04}.png",
                     bbox_inches='tight',
                     pad_inches=0,
+                    transparent=True,
                     dpi=400)
         plt.cla()
         plt.close('all')

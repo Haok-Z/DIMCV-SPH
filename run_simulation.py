@@ -15,7 +15,7 @@ ti.init(arch=ti.cuda,
 def main():
     parser = argparse.ArgumentParser(description='Dynamic Importance Monte Carlo Vortical SPH')
     parser.add_argument('--scene_file', default='', help='scene file')
-    image_path = Path("result_images")
+    image_path = Path("result_images1")
     image_path.mkdir(parents=True, exist_ok=True)
     args = parser.parse_args()
     scene_path = args.scene_file
