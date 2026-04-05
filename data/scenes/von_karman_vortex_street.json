@@ -7,7 +7,7 @@
 		"numberOfStepsPerRenderUpdate": 1,
 		"density0": 1000, 
 		"simulationMethod": 0,
-        "gravitation": [0.0, 0.0, 0.0],
+        "gravitation": [0.0, 0.0, -9.8],
 		"timeStepSize": 0.002,
 		"stiffness": 50000,
 		"exponent": 7,
@@ -22,15 +22,47 @@
 		"reservedCapacity": 1000000,
         "windowRes": [2048,512,512],
 		"divergenceTransitArea": [0.0,0.02,0.02],
-		"invisibleObjects":[1,2,2]
+		"invisibleObjects":[1,2,2],
+        "exportPLY": true
 	},
+
+    "SegmentConfiguration":
+    {
+        "domainStart": [0.0, 0.0, 0.0],
+        "domainEnd": [4.0, 1.0, 1.0],
+        "timeStepSize": 0.002,
+        "simulationTime": 12.0,
+        "segmentMaxNum": 200000,
+        "regularizationRadiusR": 0.01,
+        "backgroundVelocity": [4.0, 0.0, 0.0],
+        "splitLengthThreshold": 0.08,
+        "mergeDistanceLambda": 0.03,
+        "mergeAngleThreshold": 2.617993878,
+        "deleteGammaThreshold": 0.0001,
+        "gammaDecay": 0.999,
+        "enableBoundaryInjection": false,
+        "numBoundarySamples": 128,
+        "numGeneratedBoundarySegments": 256,
+        "exportInterval": 8,
+        "exportPLY": true,
+		"initType": "ring",
+		"initCenter": [0.2, 0.5, 0.5],
+		"initSegmentNum": 256,
+		"initRingRadius": 0.2,
+		"initGamma": 0.15,
+		"imageFollowSegments": true,
+		"imageFollowExtraScale": 1,
+		"imageFollowMinSpan": [2.5, 0.9, 0.9],
+		"imageViewMarginRatio": 0.1,
+		"imageShowColorbar": false
+    },
 
 	"FluidEmitters":[
 		{
 			"objectId": 0,
-			"squareCenter":[0.0,0.5,0.5],
-			"squareSize": [0.0, 0.94, 0.94],
-			"velocity": [3.0, 0.0, 0.0],
+			"squareCenter":[0.0,0.5,0.2],
+			"squareSize": [0.0, 0.94, 0.3],
+			"velocity": [4.0, 0.0, 0.0],
 			"density": 1000.0,
 			"color": [50, 100, 200]
 		}
@@ -40,7 +72,7 @@
 		{
 			"objectId": 1,
 			"start": [0.0, 0.0, 0.0],
-			"end": [4.0, 0.02, 0.02],
+			"end": [4.0, 0.02, 1.0],
 			"translation": [0.0, 0.0, 0.0],
 			"scale": [1, 1, 1],
 			"velocity": [0.0, 0.0, 0.0],
@@ -51,8 +83,8 @@
 		{
 			"objectId": 1,
 			"start": [0.0, 0.0, 0.0],
-			"end": [4.0, 0.02, 0.02],
-			"translation": [0.0, 0.98, 0.98],
+			"end": [4.0, 0.02, 1.0],
+			"translation": [0.0, 0.98, 0.0],
 			"scale": [1, 1, 1],
 			"velocity": [0.0, 0.0, 0.0],
 			"density": 1000.0,
@@ -62,7 +94,7 @@
 		{
 			"objectId": 1,
 			"start": [3.98, 0.02, 0.02],
-			"end": [4.0, 0.2, 0.2],
+			"end": [4.0, 0.25, 1.0],
 			"translation": [0.0, 0.0, 0.0],
 			"scale": [1, 1, 1],
 			"velocity": [0.0, 0.0, 0.0],
@@ -72,8 +104,19 @@
 		},
 		{
 			"objectId": 1,
-			"start": [3.98, 0.8, 0.8],
-			"end": [4.0, 0.98, 0.98],
+			"start": [3.98, 0.75, 0.02],
+			"end": [4.0, 0.98, 1.0],
+			"translation": [0.0, 0.0, 0.0],
+			"scale": [1, 1, 1],
+			"velocity": [0.0, 0.0, 0.0],
+			"density": 1000.0,
+			"color": [201, 112, 100],
+			"isDynamic": false
+		},
+		{
+			"objectId": 1,
+			"start": [0.0, 0.0, 0.0],
+			"end": [4.0, 1.0, 0.03],
 			"translation": [0.0, 0.0, 0.0],
 			"scale": [1, 1, 1],
 			"velocity": [0.0, 0.0, 0.0],
@@ -84,7 +127,7 @@
 		{
 			"objectId": 2,
 			"start": [0.1, 0.1, 0.1],
-			"end": [0.9, 0.9, 0.9],
+			"end": [1.5, 0.9, 0.9],
 			"translation": [0.0, 0.0, 0.0],
 			"scale": [1, 1, 1],
 			"velocity": [0.0, 0.0, 0.0],

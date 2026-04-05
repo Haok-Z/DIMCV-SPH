@@ -1,0 +1,44 @@
+{
+  "SegmentConfiguration": {
+    "domainStart": [0.0, 0.0, 0.0],
+    "domainEnd": [4.0, 1.0, 1.0],
+
+    "timeStepSize": 0.002,
+    "simulationTime": 4.0,
+
+    "segmentMaxNum": 5000,
+    "regularizationRadiusR": 0.008,
+    "backgroundVelocity": [0.0, 0.0, 0.0],
+
+    "splitLengthThreshold": 10.0,
+    "mergeDistanceLambda": 0.03,
+    "mergeAngleThreshold": 2.617993878,
+    "deleteGammaThreshold": 1e-6,
+    "gammaDecay": 0.999,
+
+    "enableBoundaryInjection": false,
+
+    "exportInterval": 4,
+    "exportPLY": true,
+
+    "initType": "triple_parallel_filaments_x",
+    "initFilamentCount": 10,
+    "initFilamentGamma": 0.8,
+    "initSegmentTypeId": 0,
+
+    "initFilamentRadiusYZ": 0.05,
+    "initFilamentYZCenter": [0.5, 0.5],
+    "initFilamentMargin": 0.05,
+
+    "enableCullSegments": false,
+    "imageFollowSegments": true,
+    "imageFollowExtraScale": 3.0,
+    "imageFollowMinSpan": [4.0, 1.2, 1.2],
+    "imageViewMarginRatio": 0.25,
+    "imageShowColorbar": false,
+
+    "exportImages": true,
+    "exportPLY": true
+  }
+}
+

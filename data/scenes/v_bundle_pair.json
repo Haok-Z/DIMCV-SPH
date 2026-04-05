@@ -1,0 +1,35 @@
+{
+  "Configuration": {
+    "particleRadius": 0.01,
+    "timeStep": 0.002,
+    "totalTime": 4.0
+  },
+  "SegmentConfiguration": {
+    "initType": "v_bundle_pair",
+    "initGamma": 0.25,
+    "vBundleCenter": [2.0, 0.5, 0.5],
+    "vBundleSize": [2.4, 0.4, 0.8],
+    "vBundleSegmentsPerLeg": 18,
+    "vBundleFilamentsPerCenter": 8,
+    "vBundleRadius": 0.06,
+    "vBundleGamma": 0.25,
+    "regularizationRadiusR": 0.03,
+    "initSegmentTypeId": 0,
+
+    "imageOutputInterval": 5,
+    "imageGammaVmin": -0.3,
+    "imageGammaVmax": 0.3,
+    "imageShowColorbar": false,
+    "imageLineWidth": 1.5,
+    "imageLineAlpha": 0.9,
+    "imagePointSize": 2.0,
+    "imagePointAlpha": 0.8,
+
+    "imageAutoFitRange": true,
+    "imageViewMarginRatio": 0.25,
+    "imageFollowSegments": true,
+    "imageFollowExtraScale": 1.8,
+    "imageFollowMinSpan": [2.0, 1.0, 1.0]
+  }
+}
+

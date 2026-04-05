@@ -62,6 +62,7 @@ class ParticleSystem:
         self.object_id_rigid_body = set()
         self.obj_id_emitters = set()
         self.obj_id_fluid_blocks = set()
+        self.obj_id_rigid_blocks = set()
 
         #========== Compute number of particles ==========#
         #### Process Fluid Blocks ####
@@ -81,7 +82,9 @@ class ParticleSystem:
             particle_num = self.compute_cube_particle_num(
                 rigid["start"], rigid["end"])
             rigid["particleNum"] = particle_num
-            self.object_collection[rigid["objectId"]] = rigid
+            obj_id = rigid["objectId"]
+            self.object_collection[obj_id] = rigid
+            self.obj_id_rigid_blocks.add(obj_id)
             rigid_particle_num += particle_num
 
         #### Process Rigid Bodies ####

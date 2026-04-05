@@ -4,6 +4,7 @@ import taichi as ti
 from config_builder import SimConfig
 from particle_system import ParticleSystem
 from pathlib import Path
+import shutil
 import time
 
 ti.init(arch=ti.cuda,
@@ -15,16 +16,36 @@ ti.init(arch=ti.cuda,
 def main():
     parser = argparse.ArgumentParser(description='Dynamic Importance Monte Carlo Vortical SPH')
     parser.add_argument('--scene_file', default='', help='scene file')
-    image_path = Path("result_images1")
+    image_path = Path("result_images")
+    # Clean previous PNGs
+    if image_path.exists():
+        for p in image_path.iterdir():
+            if p.is_file():
+                p.unlink()
+            elif p.is_dir():
+                shutil.rmtree(p)
     image_path.mkdir(parents=True, exist_ok=True)
     args = parser.parse_args()
     scene_path = args.scene_file
     config = SimConfig(scene_file_path=scene_path)
+    export_ply = config.get_cfg("exportPLY")
+    export_ply = bool(export_ply) if export_ply is not None else False
+    ply_path = None
+    if export_ply:
+        ply_path = Path("result_ply")
+        # Clean previous PLYs
+        if ply_path.exists():
+            for p in ply_path.iterdir():
+                if p.is_file():
+                    p.unlink()
+                elif p.is_dir():
+                    shutil.rmtree(p)
+        ply_path.mkdir(parents=True, exist_ok=True)
     simulation_time = config.get_cfg("simulationTime")
     substeps = config.get_cfg("numberOfStepsPerRenderUpdate")
     output_interval = int(0.016 / config.get_cfg("timeStepSize"))
 
-    ps = ParticleSystem(config, GGUI=True)
+    ps = ParticleSystem(config, GGUI=True) 
     solver = ps.build_solver()
     solver.initialize()
 
@@ -42,6 +63,9 @@ def main():
         t += solver.dt[None]
         if cnt % output_interval == 0:
             solver.export_png(cnt_output, image_path)
+            # Export corresponding PLY point cloud with particle attributes
+            if export_ply and hasattr(solver, "export_ply"):
+                solver.export_ply(cnt_output, ply_path)
             cnt_output += 1
         if cnt % 50 == 0:
             print(f"Simulation Time = {t:.2f}s")
