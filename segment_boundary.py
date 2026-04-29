@@ -2,6 +2,17 @@ import taichi as ti
 import numpy as np
 
 
+def _cfg_biot_savart_is_finite(cfg) -> bool:
+    """与 segment_solver 中约定一致：biotSavartModel 为 blob_center 时用中点 blob。"""
+    m = cfg.get_cfg("biotSavartModel", "finite_segment")
+    if m is None:
+        return True
+    m = str(m).lower().strip()
+    if m in ("blob", "blob_center", "center_blob", "lumped"):
+        return False
+    return True
+
+
 @ti.data_oriented
 class SegmentBoundaryHandler:
     def __init__(self, segment_system):
@@ -77,6 +88,37 @@ class SegmentBoundaryHandler:
     def _get_background_velocity(self) -> np.ndarray:
         v = self.ss.cfg.get_cfg("backgroundVelocity", [0.0, 0.0, 0.0])
         return np.array(v, dtype=np.float32)
+
+    @staticmethod
+    def _bs_velocity_finite_line(
+        query: np.ndarray,
+        x_minus: np.ndarray,
+        x_plus: np.ndarray,
+        gamma_seg: float,
+        reg_radius: float,
+    ) -> np.ndarray:
+        """
+        论文 TOG2021 式 (6)（与 segment_solver 有限段 BS 一致）。
+        Γ = gamma_seg * L；分母正则为 ||(x^−−x)×(x^+−x)||^2 + R^2。
+        """
+        am = x_minus.astype(np.float32, copy=False)
+        ap = x_plus.astype(np.float32, copy=False)
+        dvec = ap - am
+        L = float(np.linalg.norm(dvec)) + 1e-8
+        Gamma = float(gamma_seg) * L
+        R2 = np.float32(reg_radius * reg_radius)
+        apx = ap[None, :] - query
+        ambx = am[None, :] - query
+        n_ap = np.linalg.norm(apx, axis=1).astype(np.float32) + np.float32(reg_radius)
+        n_am = np.linalg.norm(ambx, axis=1).astype(np.float32) + np.float32(reg_radius)
+        u1 = apx / n_ap[:, None]
+        u2 = ambx / n_am[:, None]
+        d_exp = dvec.astype(np.float32, copy=False)[None, :]
+        sc = Gamma * np.sum((u1 - u2) * d_exp, axis=1)
+        cross = np.cross(ambx, apx).astype(np.float32)
+        cross_sq = np.sum(cross * cross, axis=1).astype(np.float32) + R2
+        coef = np.float32(1.0 / (4.0 * np.pi)) * sc / np.maximum(cross_sq, np.float32(1e-20))
+        return (coef[:, None] * cross).astype(np.float32)
 
     @staticmethod
     def _normalize(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -411,39 +453,40 @@ class SegmentBoundaryHandler:
         if nb == 0 or ng == 0:
             return
 
-        # 正则半径（用于避免近奇异与数值爆炸）
         R = float(self.ss.cfg.get_cfg("regularizationRadiusR", 0.01))
         R2 = R * R
+        use_finite = _cfg_biot_savart_is_finite(self.ss.cfg)
 
-        # 这里先用“段 -> 涡粒子”的近似：把每条段当作位于段中心的涡量 blob
-        # 其涡量向量取单位强度下的：omega = t * L
-        # 诱导速度采用平滑 Biot-Savart blob 形式：
-        #   u(x) = (1/4π) * (omega × r) / ( (|r|^2 + R^2)^(3/2) )
-        # 后续若要更精确，可替换为论文式(6)的有限长线段解析形式。
         xm = self._g_x_minus.astype(np.float32, copy=False)
         xp = self._g_x_plus.astype(np.float32, copy=False)
-        c = 0.5 * (xm + xp)  # (ng,3)
-        d = (xp - xm)  # (ng,3)
-        L = np.linalg.norm(d, axis=1).astype(np.float32) + 1e-8
-        t = (d.T / L).T  # (ng,3)
-        omega = (t.T * L).T  # (ng,3)，单位强度下的“等效涡量向量”
-
         K = np.zeros((3 * nb, ng), dtype=np.float32)
         inv4pi = np.float32(1.0 / (4.0 * np.pi))
 
-        # O(Nb*Ng) 直接构建 K
-        for a in range(ng):
-            ca = c[a]
-            wa = omega[a]
-            r = b - ca[None, :]  # (nb,3)
-            r2 = np.sum(r * r, axis=1) + np.float32(R2)
-            denom = np.power(r2, 1.5).astype(np.float32)
-            cross = np.cross(np.repeat(wa[None, :], nb, axis=0), r).astype(np.float32)  # (nb,3)
-            u = inv4pi * (cross.T / denom).T  # (nb,3)
-
-            K[0::3, a] = u[:, 0]
-            K[1::3, a] = u[:, 1]
-            K[2::3, a] = u[:, 2]
+        if use_finite:
+            # K 列 a：单位强度（gamma=1）虚拟段在边界点上的诱导速度；Γ=L_a。
+            for a in range(ng):
+                u = self._bs_velocity_finite_line(b, xm[a], xp[a], 1.0, R)
+                K[0::3, a] = u[:, 0]
+                K[1::3, a] = u[:, 1]
+                K[2::3, a] = u[:, 2]
+        else:
+            # 中点 blob：omega = t * L（单位 gamma）
+            c = 0.5 * (xm + xp)
+            d = xp - xm
+            L = np.linalg.norm(d, axis=1).astype(np.float32) + 1e-8
+            t = (d.T / L).T
+            omega = (t.T * L).T
+            for a in range(ng):
+                ca_tmp = c[a]
+                wa = omega[a]
+                r = b - ca_tmp[None, :]
+                r2 = np.sum(r * r, axis=1) + np.float32(R2)
+                denom = np.power(r2, 1.5).astype(np.float32)
+                cross = np.cross(np.repeat(wa[None, :], nb, axis=0), r).astype(np.float32)
+                u = inv4pi * (cross.T / denom).T
+                K[0::3, a] = u[:, 0]
+                K[1::3, a] = u[:, 1]
+                K[2::3, a] = u[:, 2]
 
         self._K = K
         self._K_nb = nb
@@ -472,7 +515,6 @@ class SegmentBoundaryHandler:
 
         u_d = np.zeros((nb, 3), dtype=np.float32)
         if include_internal:
-            # 使用与 compute_k_matrix 相同的稳定 blob 近似来计算内部段对边界点的诱导速度
             Ns = int(self.ss.segment_num[None])
             if Ns > 0:
                 xm = self.ss.x_minus.to_numpy()[:Ns].astype(np.float32, copy=False)
@@ -481,27 +523,32 @@ class SegmentBoundaryHandler:
                 gamma = self.ss.gamma.to_numpy()[:Ns].astype(np.float32, copy=False)
 
                 R = float(self.ss.cfg.get_cfg("regularizationRadiusR", 0.01))
-                R2 = R * R
-                inv4pi = np.float32(1.0 / (4.0 * np.pi))
+                use_finite = _cfg_biot_savart_is_finite(self.ss.cfg)
 
-                # 将每条段转换为等效涡量向量：omega = gamma * t * L
-                c = 0.5 * (xm + xp)
-                d = (xp - xm)
-                L = np.linalg.norm(d, axis=1).astype(np.float32) + 1e-8
-                t = (d.T / L).T
-                omega = (t.T * (gamma * L)).T  # (Ns,3)
-
-                for j in range(Ns):
-                    if active[j] != 1:
-                        continue
-                    cj = c[j]
-                    wj = omega[j]
-                    r = b - cj[None, :]
-                    r2 = np.sum(r * r, axis=1) + np.float32(R2)
-                    denom = np.power(r2, 1.5).astype(np.float32)
-                    cross = np.cross(np.repeat(wj[None, :], nb, axis=0), r).astype(np.float32)
-                    u = inv4pi * (cross.T / denom).T
-                    u_d += u
+                if use_finite:
+                    for j in range(Ns):
+                        if active[j] != 1:
+                            continue
+                        u_d += self._bs_velocity_finite_line(b, xm[j], xp[j], float(gamma[j]), R)
+                else:
+                    R2 = R * R
+                    inv4pi = np.float32(1.0 / (4.0 * np.pi))
+                    c = 0.5 * (xm + xp)
+                    d = xp - xm
+                    L = np.linalg.norm(d, axis=1).astype(np.float32) + 1e-8
+                    t = (d.T / L).T
+                    omega = (t.T * (gamma * L)).T
+                    for j in range(Ns):
+                        if active[j] != 1:
+                            continue
+                        cj = c[j]
+                        wj = omega[j]
+                        r = b - cj[None, :]
+                        r2 = np.sum(r * r, axis=1) + np.float32(R2)
+                        denom = np.power(r2, 1.5).astype(np.float32)
+                        cross = np.cross(np.repeat(wj[None, :], nb, axis=0), r).astype(np.float32)
+                        u = inv4pi * (cross.T / denom).T
+                        u_d += u
 
         U = (ub - u_d - u_inf[None, :]).astype(np.float32)
         U_flat = np.zeros((3 * nb,), dtype=np.float32)

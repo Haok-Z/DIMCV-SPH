@@ -1,0 +1,70 @@
+{
+  "Configuration": {
+    "particleRadius": 0.01,
+    "timeStep": 0.002,
+    "totalTime": 4.0
+  },
+  "SegmentConfiguration": {
+    "domainStart": [0.0, 0.0, 0.0],
+    "domainEnd": [4.0, 1.0, 1.0],
+    "timeStepSize": 0.0025,
+    "simulationTime": 10.0,
+    "segmentMaxNum": 400000,
+
+    "biotSavartModel": "finite_segment",
+    "regularizationRadiusR": 0.0005,
+    "backgroundVelocity": [0.0, 0.0, 0.0],
+
+    "splitLengthThreshold": 0.06,
+    "mergeDistanceLambda": 0.02,
+    "mergeAngleThreshold": 2.617993878,
+    "deleteGammaThreshold": 0.0001,
+    "gammaDecay": 1.0,
+    "enableBoundaryInjection": false,
+
+    "exportInterval": 2,
+    "exportPLY": true,
+    "exportImages": true,
+
+    "initType": "leapfrog_rings",
+    "initSegmentTypeId": 0,
+
+    "leapfrogAxis": [1.0, 0.0, 0.0],
+    "leapfrogCenterYZ": [0.5, 0.5],
+
+    "leapfrogRing1CenterX": 0.0,
+    "leapfrogRing2CenterX": 0.25,
+    "leapfrogRing1Radius": 0.27,
+    "leapfrogRing2Radius": 0.3,
+    "leapfrogRing1Gamma": 120,
+    "leapfrogRing2Gamma": 120,
+    "leapfrogRing1SegmentTypeId": 101,
+    "leapfrogRing2SegmentTypeId": 102,
+    "leapfrogRing1BackgroundVelocity": [0.0, 0.0, 0.0],
+    "leapfrogRing2BackgroundVelocity": [0.0, 0.0, 0.0],
+    "leapfrogRing1InitialImpulseVelocity": [4.5, 0.0, 0.0],
+    "leapfrogRing2InitialImpulseVelocity": [3, 0.0, 0.0],
+    "leapfrogImpulseDecayTau": 0.08,
+    "leapfrogImpulseStopEps": 0.001,
+
+    "leapfrogTubeRadius": 0.04,
+    "leapfrogSegmentsPerRing": 128,
+    "leapfrogFilamentsPerSection": 10,
+    "leapfrogGammaSplit": true,
+
+    "imageFollowSegments": false,
+    "imageViewStart": [0.0, 0.15, 0.15],
+    "imageViewEnd": [2.2, 0.85, 0.85],
+    "imageViewMarginRatio": 0.1,
+    "imageShowColorbar": false,
+    "imageUseSegmentTypeColors": true,
+    "imageRing1Color": [255, 80, 80],
+    "imageRing2Color": [80, 170, 255],
+    "imageOtherSegmentColor": [210, 210, 210],
+    "imageLineWidth": 1.2,
+    "imageLineAlpha": 0.9,
+    "imagePointSize": 1.5,
+    "imagePointAlpha": 0.7
+  }
+}
+

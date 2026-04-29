@@ -8,6 +8,17 @@ class SegmentExporter:
     def __init__(self, segment_system):
         self.ss = segment_system
 
+    @staticmethod
+    def _to_rgb01(v, default_rgb):
+        arr = np.array(v if v is not None else default_rgb, dtype=np.float32).reshape(-1)
+        if arr.size < 3:
+            arr = np.array(default_rgb, dtype=np.float32)
+        rgb = arr[:3]
+        # 兼容 0-255 与 0-1 两种输入
+        if float(np.max(rgb)) > 1.0:
+            rgb = rgb / 255.0
+        return np.clip(rgb, 0.0, 1.0)
+
     def export_segments_ply(self, frame_id: int, out_dir: Path):
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"segments_{frame_id:04}.ply"
@@ -59,6 +70,7 @@ class SegmentExporter:
         x_plus = self.ss.x_plus.to_numpy()[:n]
         gamma = self.ss.gamma.to_numpy()[:n]
         active = self.ss.active.to_numpy()[:n].astype(bool)
+        seg_type = self.ss.seg_type.to_numpy()[:n]
 
         if not np.any(active):
             return
@@ -66,6 +78,7 @@ class SegmentExporter:
         x_minus = x_minus[active]
         x_plus = x_plus[active]
         gamma = gamma[active]
+        seg_type = seg_type[active]
 
         # 使用段中心做着色可视化，颜色编码 gamma
         center = 0.5 * (x_minus + x_plus)
@@ -91,12 +104,36 @@ class SegmentExporter:
         norm = Normalize(vmin=vmin, vmax=vmax)
         cmap = "coolwarm"
 
-        # 先画涡丝线段（按 gamma 着色）
+        # 先画涡丝线段（默认按 gamma 着色；可切换为按 seg_type 着色）
         line_width = float(self.ss.cfg.get_cfg("imageLineWidth", 0.8))
         line_alpha = float(self.ss.cfg.get_cfg("imageLineAlpha", 0.9))
         cm = plt.get_cmap(cmap)
+        use_type_colors = bool(self.ss.cfg.get_cfg("imageUseSegmentTypeColors", False))
+        ring1_type = int(self.ss.cfg.get_cfg("leapfrogRing1SegmentTypeId", 101))
+        ring2_type = int(self.ss.cfg.get_cfg("leapfrogRing2SegmentTypeId", 102))
+        ring1_color = self._to_rgb01(
+            self.ss.cfg.get_cfg("imageRing1Color", [255, 80, 80]),
+            [1.0, 0.31, 0.31],
+        )
+        ring2_color = self._to_rgb01(
+            self.ss.cfg.get_cfg("imageRing2Color", [80, 170, 255]),
+            [0.31, 0.67, 1.0],
+        )
+        other_color = self._to_rgb01(
+            self.ss.cfg.get_cfg("imageOtherSegmentColor", [210, 210, 210]),
+            [0.82, 0.82, 0.82],
+        )
         for i in range(x_minus.shape[0]):
-            col = cm(norm(float(gamma[i])))
+            if use_type_colors:
+                st = int(seg_type[i])
+                if st == ring1_type:
+                    col = ring1_color
+                elif st == ring2_type:
+                    col = ring2_color
+                else:
+                    col = other_color
+            else:
+                col = cm(norm(float(gamma[i])))
             ax.plot(
                 [float(x_minus[i, 0]), float(x_plus[i, 0])],
                 [float(x_minus[i, 1]), float(x_plus[i, 1])],
@@ -107,19 +144,39 @@ class SegmentExporter:
             )
 
         # 再画散点（中心点）
-        sc = ax.scatter(
-            center[:, 0],
-            center[:, 1],
-            center[:, 2],
-            c=gamma,
-            cmap=cmap,
-            s=float(self.ss.cfg.get_cfg("imagePointSize", 1.0)),
-            norm=norm,
-            edgecolors="none",
-            alpha=float(self.ss.cfg.get_cfg("imagePointAlpha", 0.6)),
-        )
-        if bool(self.ss.cfg.get_cfg("imageShowColorbar", False)):
-            fig.colorbar(sc, ax=ax, fraction=0.02, pad=0.01)
+        if use_type_colors:
+            point_colors = np.zeros((center.shape[0], 3), dtype=np.float32)
+            for i in range(center.shape[0]):
+                st = int(seg_type[i])
+                if st == ring1_type:
+                    point_colors[i] = ring1_color
+                elif st == ring2_type:
+                    point_colors[i] = ring2_color
+                else:
+                    point_colors[i] = other_color
+            ax.scatter(
+                center[:, 0],
+                center[:, 1],
+                center[:, 2],
+                c=point_colors,
+                s=float(self.ss.cfg.get_cfg("imagePointSize", 1.0)),
+                edgecolors="none",
+                alpha=float(self.ss.cfg.get_cfg("imagePointAlpha", 0.6)),
+            )
+        else:
+            sc = ax.scatter(
+                center[:, 0],
+                center[:, 1],
+                center[:, 2],
+                c=gamma,
+                cmap=cmap,
+                s=float(self.ss.cfg.get_cfg("imagePointSize", 1.0)),
+                norm=norm,
+                edgecolors="none",
+                alpha=float(self.ss.cfg.get_cfg("imagePointAlpha", 0.6)),
+            )
+            if bool(self.ss.cfg.get_cfg("imageShowColorbar", False)):
+                fig.colorbar(sc, ax=ax, fraction=0.02, pad=0.01)
 
         domain_start = self.ss.domain_start.astype(np.float32)
         domain_end = self.ss.domain_end.astype(np.float32)

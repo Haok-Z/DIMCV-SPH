@@ -6,14 +6,14 @@
   },
   "SegmentConfiguration": {
     "initType": "v_bundle_pair",
-    "initGamma": 0.25,
+    "initGamma": 25,
     "vBundleCenter": [2.0, 0.5, 0.5],
     "vBundleSize": [2.4, 0.4, 0.8],
     "vBundleSegmentsPerLeg": 18,
     "vBundleFilamentsPerCenter": 8,
     "vBundleRadius": 0.06,
     "vBundleGamma": 0.25,
-    "regularizationRadiusR": 0.03,
+    "regularizationRadiusR": 0.003,
     "initSegmentTypeId": 0,
 
     "imageOutputInterval": 5,

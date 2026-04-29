@@ -4,6 +4,21 @@ import numpy as np
 from segment_boundary import SegmentBoundaryHandler
 
 
+def _segment_cfg_biot_savart_is_finite(cfg) -> bool:
+    """
+    SegmentConfiguration.biotSavartModel:
+    - finite_segment（默认）：有限长直线段 Biot–Savart 闭式（与 Vortex Segment 类论文常用离散一致）
+    - blob_center：段中点 + 平滑 blob（旧实现，数值更钝、易调）
+    """
+    m = cfg.get_cfg("biotSavartModel", "finite_segment")
+    if m is None:
+        return True
+    m = str(m).lower().strip()
+    if m in ("blob", "blob_center", "center_blob", "lumped"):
+        return False
+    return True
+
+
 @ti.data_oriented
 class SegmentSolver:
     def __init__(self, segment_system):
@@ -19,9 +34,47 @@ class SegmentSolver:
         )
         self.u_inf = ti.Vector.field(3, dtype=float, shape=())
         self.u_inf.from_numpy(self.background_velocity)
+        # Leapfrog 两个环可选的独立背景速度（默认关闭）
+        self._use_leapfrog_ring_bg = ti.field(dtype=ti.i32, shape=())
+        self._ring1_seg_type = ti.field(dtype=ti.i32, shape=())
+        self._ring2_seg_type = ti.field(dtype=ti.i32, shape=())
+        self._ring1_u_inf = ti.Vector.field(3, dtype=float, shape=())
+        self._ring2_u_inf = ti.Vector.field(3, dtype=float, shape=())
+        self._use_leapfrog_ring_bg[None] = 0
+        self._ring1_seg_type[None] = int(self.ss.cfg.get_cfg("leapfrogRing1SegmentTypeId", 101))
+        self._ring2_seg_type[None] = int(self.ss.cfg.get_cfg("leapfrogRing2SegmentTypeId", 102))
+        self._ring1_u_inf.from_numpy(
+            np.array(self.ss.cfg.get_cfg("leapfrogRing1BackgroundVelocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+        )
+        self._ring2_u_inf.from_numpy(
+            np.array(self.ss.cfg.get_cfg("leapfrogRing2BackgroundVelocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+        )
+        # Leapfrog 两个环可选“一次性初始脉冲速度”（仅首步生效）
+        self._use_leapfrog_initial_impulse = ti.field(dtype=ti.i32, shape=())
+        self._ring1_impulse = ti.Vector.field(3, dtype=float, shape=())
+        self._ring2_impulse = ti.Vector.field(3, dtype=float, shape=())
+        self._use_leapfrog_initial_impulse[None] = 0
+        self._ring1_impulse.from_numpy(
+            np.array(self.ss.cfg.get_cfg("leapfrogRing1InitialImpulseVelocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+        )
+        self._ring2_impulse.from_numpy(
+            np.array(self.ss.cfg.get_cfg("leapfrogRing2InitialImpulseVelocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+        )
+        # 脉冲速度衰减参数：dv/dt = -v/tau  => 每步乘 exp(-dt/tau)
+        self._impulse_decay_factor = ti.field(dtype=float, shape=())
+        self._impulse_decay_stop_eps = ti.field(dtype=float, shape=())
+        tau = float(self.ss.cfg.get_cfg("leapfrogImpulseDecayTau", 0.15))
+        if tau > 0.0:
+            decay = float(np.exp(-self.dt / tau))
+        else:
+            # tau<=0 退化为“单步脉冲”
+            decay = 0.0
+        self._impulse_decay_factor[None] = decay
+        self._impulse_decay_stop_eps[None] = float(self.ss.cfg.get_cfg("leapfrogImpulseStopEps", 1e-4))
 
         self.boundary = SegmentBoundaryHandler(self.ss)
         self.has_boundary = self.boundary.enable_boundary_injection
+        self._bs_finite = _segment_cfg_biot_savart_is_finite(self.ss.cfg)
 
         self.v_minus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
         self.v_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
@@ -36,6 +89,33 @@ class SegmentSolver:
         self.k2_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
         self.k3_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
         self.k4_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
+
+    @ti.func
+    def _segment_background(self, i: int):
+        u = self.u_inf[None]
+        if self._use_leapfrog_ring_bg[None] == 1:
+            st = self.ss.seg_type[i]
+            if st == self._ring1_seg_type[None]:
+                u = u + self._ring1_u_inf[None]
+            elif st == self._ring2_seg_type[None]:
+                u = u + self._ring2_u_inf[None]
+        if self._use_leapfrog_initial_impulse[None] == 1:
+            st = self.ss.seg_type[i]
+            if st == self._ring1_seg_type[None]:
+                u = u + self._ring1_impulse[None]
+            elif st == self._ring2_seg_type[None]:
+                u = u + self._ring2_impulse[None]
+        return u
+
+    @ti.kernel
+    def _decay_impulse_kernel(self):
+        if self._use_leapfrog_initial_impulse[None] == 1:
+            f = self._impulse_decay_factor[None]
+            self._ring1_impulse[None] = f * self._ring1_impulse[None]
+            self._ring2_impulse[None] = f * self._ring2_impulse[None]
+            e = self._impulse_decay_stop_eps[None]
+            if self._ring1_impulse[None].norm() < e and self._ring2_impulse[None].norm() < e:
+                self._use_leapfrog_initial_impulse[None] = 0
 
     def initialize(self):
         self.ss.clear()
@@ -54,6 +134,9 @@ class SegmentSolver:
         if init_type is None:
             init_type = "ring"
         init_type = str(init_type).lower()
+        # 默认关闭按环独立背景速度，仅 leapfrog_rings 初始化会开启
+        self._use_leapfrog_ring_bg[None] = 0
+        self._use_leapfrog_initial_impulse[None] = 0
 
         if init_type == "none":
             return
@@ -66,9 +149,13 @@ class SegmentSolver:
             self._seed_v_bundle_pair()
             return
 
+        if init_type == "leapfrog_rings":
+            self._seed_leapfrog_rings()
+            return
+
         if init_type != "ring":
             raise NotImplementedError(
-                f"initType={init_type} 尚未实现（当前支持 ring / triple_parallel_filaments_x / v_bundle_pair / none）"
+                f"initType={init_type} 尚未实现（当前支持 ring / triple_parallel_filaments_x / v_bundle_pair / leapfrog_rings / none）"
             )
 
         # 读取初始化参数
@@ -84,6 +171,24 @@ class SegmentSolver:
             c = 0.5 * (self.ss.domain_start + self.ss.domain_end)
         else:
             c = np.array(center_cfg, dtype=np.float32)
+
+        # 可选：对环中心与环上点加随机扰动（打破对称，便于观察涡环演化）
+        # SegmentConfiguration:
+        # - initPerturbSeed: int | null，固定种子可复现；不设则每次运行不同
+        # - initCenterJitter: 标量或 [ax,ay,az]，在 [-j,j] 上均匀扰动中心各分量
+        # - initRingRadialJitter: 每段顶点在环平面内径向扰动（米），半径 = initRingRadius + 噪声
+        # - initRingPhaseJitter: 每段顶点角度扰动（弧度），在 [-p,p] 均匀
+        seed = self.ss.cfg.get_cfg("initPerturbSeed", None)
+        rng = np.random.default_rng(seed)
+        jc = self.ss.cfg.get_cfg("initCenterJitter", 0.0)
+        if jc is not None:
+            if isinstance(jc, (list, tuple)) and len(jc) >= 3:
+                w = np.array(jc[:3], dtype=np.float64)
+                c = (c.astype(np.float64) + rng.uniform(-w, w)).astype(np.float32)
+            else:
+                jf = float(jc)
+                if jf > 0.0:
+                    c = (c.astype(np.float64) + rng.uniform(-jf, jf, size=3)).astype(np.float32)
 
         # 环法向：默认取背景速度方向（若为 0 则回退到 x 轴）
         axis_cfg = self.ss.cfg.get_cfg("initRingAxis", None)
@@ -107,9 +212,20 @@ class SegmentSolver:
         e2 = e2 / (np.linalg.norm(e2) + 1e-8)
 
         # 生成环上点并拼成 segments（相邻点连线）
-        angles = np.linspace(0.0, 2.0 * np.pi, n_seg + 1, dtype=np.float32)[:-1]
-        pts = (c[None, :] + ring_radius * (np.cos(angles)[:, None] * e1[None, :] +
-                                           np.sin(angles)[:, None] * e2[None, :])).astype(np.float32)
+        angles = np.linspace(0.0, 2.0 * np.pi, n_seg + 1, dtype=np.float64)[:-1]
+        jr = float(self.ss.cfg.get_cfg("initRingRadialJitter", 0.0))
+        jp = float(self.ss.cfg.get_cfg("initRingPhaseJitter", 0.0))
+        if jp != 0.0:
+            angles = angles + rng.uniform(-jp, jp, size=n_seg)
+        radii = np.full((n_seg,), float(ring_radius), dtype=np.float64)
+        if jr != 0.0:
+            radii = radii + rng.uniform(-jr, jr, size=n_seg)
+        radii = np.maximum(radii, float(self.ss.cfg.get_cfg("initRingRadiusMin", 1e-4)))
+        pts = (
+            c[None, :].astype(np.float64)
+            + radii[:, None] * (np.cos(angles)[:, None] * e1[None, :].astype(np.float64)
+                                + np.sin(angles)[:, None] * e2[None, :].astype(np.float64))
+        ).astype(np.float32)
 
         x_minus = pts
         x_plus = np.roll(pts, shift=-1, axis=0)
@@ -340,6 +456,144 @@ class SegmentSolver:
         )
         self.ss.segment_num[None] = offset + n_final
 
+    def _seed_leapfrog_rings(self):
+        """
+        蛙跳涡（Leapfrogging vortex rings）初始化：
+        - 一个小半径/强度更大（更快）的涡环从后方追赶
+        - 一个大半径/强度更小（更慢）的涡环在前方
+        两个涡环都具有“厚度”：用截面圆上多股涡丝（多条环状 filament）拼成涡管。
+
+        SegmentConfiguration 参数（默认值给一个可跑的起点）：
+        - leapfrogAxis: [ax,ay,az] 轴向（默认 [1,0,0]，沿 x 方向蛙跳）
+        - leapfrogCenterYZ: [y,z] 两环的 y/z 中心（默认取 domain 中心）
+        - leapfrogRing1CenterX / leapfrogRing2CenterX: 两环的 x 位置（默认 0.8 / 1.3）
+        - leapfrogRing1Radius / leapfrogRing2Radius: 两环主半径（默认 0.16 / 0.24）
+        - leapfrogRing1Gamma / leapfrogRing2Gamma: 两环总强度参数（默认 0.9 / 0.5）
+        - leapfrogTubeRadius: 厚度（截面半径，默认 0.04）
+        - leapfrogSegmentsPerRing: 环向离散段数（默认 256）
+        - leapfrogFilamentsPerSection: 截面上 filament 条数（默认 8）
+        - leapfrogGammaSplit: 是否将 ringGamma 均分到 filament（默认 true）
+        - leapfrogRing1SegmentTypeId / leapfrogRing2SegmentTypeId: 两环段类型 id（用于独立背景速度）
+        - leapfrogRing1BackgroundVelocity / leapfrogRing2BackgroundVelocity: 两环背景速度增量
+        """
+        cfg = self.ss.cfg
+        seg_type1 = int(cfg.get_cfg("leapfrogRing1SegmentTypeId", self._ring1_seg_type[None]))
+        seg_type2 = int(cfg.get_cfg("leapfrogRing2SegmentTypeId", self._ring2_seg_type[None]))
+        # 打开“按环叠加独立背景速度”开关；速度值可为 0（不生效）
+        self._use_leapfrog_ring_bg[None] = 1
+        self._ring1_seg_type[None] = seg_type1
+        self._ring2_seg_type[None] = seg_type2
+        # 按需打开“一次性初始脉冲速度”
+        imp1 = np.array(cfg.get_cfg("leapfrogRing1InitialImpulseVelocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+        imp2 = np.array(cfg.get_cfg("leapfrogRing2InitialImpulseVelocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+        self._ring1_impulse.from_numpy(imp1)
+        self._ring2_impulse.from_numpy(imp2)
+        if float(np.linalg.norm(imp1)) > 0.0 or float(np.linalg.norm(imp2)) > 0.0:
+            self._use_leapfrog_initial_impulse[None] = 1
+        else:
+            self._use_leapfrog_initial_impulse[None] = 0
+
+        axis_cfg = cfg.get_cfg("leapfrogAxis", [1.0, 0.0, 0.0])
+        axis = np.array(axis_cfg, dtype=np.float64)
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+
+        yz_center = cfg.get_cfg("leapfrogCenterYZ", None)
+        if yz_center is None:
+            c_dom = 0.5 * (self.ss.domain_start + self.ss.domain_end)
+            cy, cz = float(c_dom[1]), float(c_dom[2])
+        else:
+            cy, cz = float(yz_center[0]), float(yz_center[1])
+
+        x1 = float(cfg.get_cfg("leapfrogRing1CenterX", 0.8))
+        x2 = float(cfg.get_cfg("leapfrogRing2CenterX", 1.3))
+        R1 = float(cfg.get_cfg("leapfrogRing1Radius", 0.16))
+        R2 = float(cfg.get_cfg("leapfrogRing2Radius", 0.24))
+        G1 = float(cfg.get_cfg("leapfrogRing1Gamma", 0.9))
+        G2 = float(cfg.get_cfg("leapfrogRing2Gamma", 0.5))
+        a = float(cfg.get_cfg("leapfrogTubeRadius", 0.04))
+
+        n_theta = int(cfg.get_cfg("leapfrogSegmentsPerRing", 256))
+        n_theta = max(16, n_theta)
+        n_phi = int(cfg.get_cfg("leapfrogFilamentsPerSection", 8))
+        n_phi = max(1, n_phi)
+        gamma_split = bool(cfg.get_cfg("leapfrogGammaSplit", True))
+
+        # 构造环平面基 (e1, e2)：与 ring axis 垂直
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(float(np.dot(axis, ref))) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        e1 = np.cross(axis, ref)
+        e1 = e1 / (np.linalg.norm(e1) + 1e-12)
+        e2 = np.cross(axis, e1)
+        e2 = e2 / (np.linalg.norm(e2) + 1e-12)
+
+        def build_thick_ring(center: np.ndarray, R: float, ring_gamma: float):
+            """
+            返回 x_minus/x_plus/gamma 三个数组，表示一条“厚涡环”由 n_phi 条 filament 组成；
+            每条 filament 由 n_theta 个小段闭合成环。
+            """
+            angles = np.linspace(0.0, 2.0 * np.pi, n_theta + 1, endpoint=True, dtype=np.float64)[:-1]
+            cos_t = np.cos(angles)
+            sin_t = np.sin(angles)
+
+            # 环中心线上每个角度点的中心位置（不带厚度）
+            cline = center[None, :] + R * (cos_t[:, None] * e1[None, :] + sin_t[:, None] * e2[None, :])
+
+            # 环向切向与径向（用于构造截面平面）
+            t_hat = (-sin_t[:, None] * e1[None, :] + cos_t[:, None] * e2[None, :])
+            t_hat = t_hat / (np.linalg.norm(t_hat, axis=1, keepdims=True) + 1e-12)
+            n_hat = (cos_t[:, None] * e1[None, :] + sin_t[:, None] * e2[None, :])
+            n_hat = n_hat / (np.linalg.norm(n_hat, axis=1, keepdims=True) + 1e-12)
+            b_hat = np.cross(t_hat, n_hat)
+            b_hat = b_hat / (np.linalg.norm(b_hat, axis=1, keepdims=True) + 1e-12)
+
+            phis = np.linspace(0.0, 2.0 * np.pi, n_phi, endpoint=False, dtype=np.float64)
+            cos_p = np.cos(phis)
+            sin_p = np.sin(phis)
+
+            pts = np.zeros((n_phi, n_theta, 3), dtype=np.float64)
+            for p in range(n_phi):
+                offset = a * (cos_p[p] * n_hat + sin_p[p] * b_hat)  # (n_theta,3)
+                pts[p] = cline + offset
+
+            # 连接每条 filament 的相邻点形成小段
+            xm = pts.reshape(-1, 3).astype(np.float32)  # (n_phi*n_theta,3)
+            # x_plus：沿 theta 方向 roll（每条 filament 独立闭合）
+            pts_roll = np.roll(pts, shift=-1, axis=1)
+            xp = pts_roll.reshape(-1, 3).astype(np.float32)
+
+            if gamma_split and n_phi > 0:
+                g_each = float(ring_gamma) / float(n_phi)
+            else:
+                g_each = float(ring_gamma)
+            g = (g_each * np.ones((n_phi * n_theta,), dtype=np.float32))
+            return xm, xp, g
+
+        c1 = np.array([x1, cy, cz], dtype=np.float64)
+        c2 = np.array([x2, cy, cz], dtype=np.float64)
+
+        xm1, xp1, g1 = build_thick_ring(c1, R1, G1)
+        xm2, xp2, g2 = build_thick_ring(c2, R2, G2)
+
+        offset = int(self.ss.segment_num[None])
+        capacity = int(self.ss.segment_max_num)
+        if offset >= capacity:
+            return
+
+        n1 = int(min(xm1.shape[0], capacity - offset))
+        if n1 > 0:
+            self._seed_segments_kernel(offset, n1, xm1[:n1], xp1[:n1], g1[:n1], seg_type1)
+            offset += n1
+        if offset >= capacity:
+            return
+        n2 = int(min(xm2.shape[0], capacity - offset))
+        if n2 <= 0:
+            self.ss.segment_num[None] = offset
+            return
+
+        self._seed_segments_kernel(offset, n2, xm2[:n2], xp2[:n2], g2[:n2], seg_type2)
+        self.ss.segment_num[None] = offset + n2
+
     @ti.kernel
     def _seed_segments_kernel(
         self,
@@ -373,10 +627,22 @@ class SegmentSolver:
         - 第一版可用 O(N^2) 直接求和
         - 后续可用网格或多极近似进行加速
         """
-        self._compute_endpoint_velocity_bs(float(self.reg_radius))
+        if self._bs_finite:
+            self._compute_endpoint_velocity_bs_finite(float(self.reg_radius))
+            n = int(self.ss.segment_num[None])
+            v_m = self.v_minus.to_numpy()[:n]
+            v_p = self.v_plus.to_numpy()[:n]
+
+            print("v_minus[0:5] =", v_m[:5])
+            print("v_plus[0:5]  =", v_p[:5])
+            print("speed_minus mean/max =", (v_m**2).sum(axis=1).mean()**0.5, ((v_m**2).sum(axis=1).max())**0.5)
+            print("speed_plus  mean/max =", (v_p**2).sum(axis=1).mean()**0.5, ((v_p**2).sum(axis=1).max())**0.5)
+        else:
+            self._compute_endpoint_velocity_bs_blob(float(self.reg_radius))
 
     @ti.kernel
-    def _compute_endpoint_velocity_bs(self, reg_radius: float):
+    def _compute_endpoint_velocity_bs_blob(self, reg_radius: float):
+        """段中点涡 blob（旧版）：omega = gamma * L * t。"""
         inv4pi = 1.0 / (4.0 * ti.math.pi)
         R2 = reg_radius * reg_radius
         n = self.ss.segment_num[None]
@@ -387,8 +653,8 @@ class SegmentSolver:
 
             xmi = self.ss.x_minus[i]
             xpi = self.ss.x_plus[i]
-            ui_m = self.u_inf[None]
-            ui_p = self.u_inf[None]
+            ui_m = self._segment_background(i)
+            ui_p = self._segment_background(i)
 
             for j in range(n):
                 if j == i or self.ss.active[j] != 1:
@@ -417,6 +683,69 @@ class SegmentSolver:
             self.v_minus[i] = ui_m
             self.v_plus[i] = ui_p
 
+    @ti.kernel
+    def _compute_endpoint_velocity_bs_finite(self, reg_radius: float):
+        """
+        论文 TOG2021 式 (6)：三维涡段云上的 Biot–Savart（Weißmann & Pinkall 形式）。
+
+        u_j^BS(x) = Γ_j/(4π) * [ ( (x_j^+−x)/(|x_j^+−x|+R) − (x_j^−−x)/(|x_j^−−x|+R) ) · (x_j^+−x_j^−) ]
+                              * [ (x_j^−−x)×(x_j^+−x) / ( |(x_j^−−x)×(x_j^+−x)|^2 + R^2 ) ]
+
+        注意：同节式 (7) 为二维点涡，不用于本三维求解器。
+
+        数据约定：段上涡向量取 gamma*(x^+−x^−)，则 Γ_j = gamma_j * L_j。
+        """
+        inv4pi = 1.0 / (4.0 * ti.math.pi)
+        R2 = reg_radius * reg_radius
+        n = self.ss.segment_num[None]
+
+        for i in range(n):
+            if self.ss.active[i] != 1:
+                continue
+
+            xmi = self.ss.x_minus[i]
+            xpi = self.ss.x_plus[i]
+            ui_m = self._segment_background(i)
+            ui_p = self._segment_background(i)
+
+            for j in range(n):
+                if j == i or self.ss.active[j] != 1:
+                    continue
+
+                am = self.ss.x_minus[j]
+                ap = self.ss.x_plus[j]
+                d = ap - am
+                Lj = d.norm() + 1e-8
+                gamma_j = self.ss.gamma[j]
+                Gamma = gamma_j * Lj
+
+                # --- 查询 x = xmi ---
+                apx = ap - xmi
+                ambx = am - xmi
+                n_ap = apx.norm() + reg_radius
+                n_am = ambx.norm() + reg_radius
+                u1 = apx / (n_ap + 1e-12)
+                u2 = ambx / (n_am + 1e-12)
+                sc = (u1 - u2).dot(d)
+                cr = ambx.cross(apx)
+                cross_sq = cr.dot(cr) + R2
+                ui_m += inv4pi * Gamma * sc / (cross_sq + 1e-20) * cr
+
+                # --- 查询 x = xpi ---
+                apxp = ap - xpi
+                ambxp = am - xpi
+                n_app = apxp.norm() + reg_radius
+                n_amp = ambxp.norm() + reg_radius
+                u1p = apxp / (n_app + 1e-12)
+                u2p = ambxp / (n_amp + 1e-12)
+                scp = (u1p - u2p).dot(d)
+                crp = ambxp.cross(apxp)
+                cross_sqp = crp.dot(crp) + R2
+                ui_p += inv4pi * Gamma * scp / (cross_sqp + 1e-20) * crp
+
+            self.v_minus[i] = ui_m
+            self.v_plus[i] = ui_p
+
     def advect_segments_rk4(self):
         """
         TODO：
@@ -432,15 +761,15 @@ class SegmentSolver:
         self._copy_v_to_k1()
 
         # 2) k2：在 x + 0.5*dt*k1 位置计算速度
-        self._compute_velocity_at_factor(0.5, self.k1_minus, self.k1_plus,
+        self._velocity_at_factor_dispatch(0.5, self.k1_minus, self.k1_plus,
                                           self.k2_minus, self.k2_plus)
 
         # 3) k3：在 x + 0.5*dt*k2 位置计算速度
-        self._compute_velocity_at_factor(0.5, self.k2_minus, self.k2_plus,
+        self._velocity_at_factor_dispatch(0.5, self.k2_minus, self.k2_plus,
                                           self.k3_minus, self.k3_plus)
 
         # 4) k4：在 x + dt*k3 位置计算速度
-        self._compute_velocity_at_factor(1.0, self.k3_minus, self.k3_plus,
+        self._velocity_at_factor_dispatch(1.0, self.k3_minus, self.k3_plus,
                                           self.k4_minus, self.k4_plus)
 
         # 5) 更新端点位置并推进 gamma / age
@@ -465,8 +794,25 @@ class SegmentSolver:
                 self.k1_minus[i] = self.v_minus[i]
                 self.k1_plus[i] = self.v_plus[i]
 
+    def _velocity_at_factor_dispatch(
+        self,
+        factor: float,
+        k_minus_in,
+        k_plus_in,
+        out_minus,
+        out_plus,
+    ):
+        if self._bs_finite:
+            self._compute_velocity_at_factor_finite(
+                factor, k_minus_in, k_plus_in, out_minus, out_plus, float(self.reg_radius)
+            )
+        else:
+            self._compute_velocity_at_factor_blob(
+                factor, k_minus_in, k_plus_in, out_minus, out_plus
+            )
+
     @ti.kernel
-    def _compute_velocity_at_factor(
+    def _compute_velocity_at_factor_blob(
         self,
         factor: float,
         k_minus_in: ti.template(),
@@ -475,12 +821,7 @@ class SegmentSolver:
         out_plus: ti.template(),
     ):
         """
-        计算速度：在查询点
-            x_minus_query = x_minus + factor * dt * k_minus_in
-            x_plus_query  = x_plus  + factor * dt * k_plus_in
-        处求 u(x)。
-
-        该 kernel 复用当前段池中段的几何（端点/强度不在 RK4 子步变化）。
+        在试探点 x + factor*dt*k 处求 u(x)（中点 blob）。
         """
         inv4pi = 1.0 / (4.0 * ti.math.pi)
         R2 = self.reg_radius * self.reg_radius
@@ -493,8 +834,8 @@ class SegmentSolver:
             xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
             xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
 
-            ui_m = self.u_inf[None]
-            ui_p = self.u_inf[None]
+            ui_m = self._segment_background(i)
+            ui_p = self._segment_background(i)
 
             for j in range(n):
                 if j == i or self.ss.active[j] != 1:
@@ -502,20 +843,74 @@ class SegmentSolver:
 
                 xmj = self.ss.x_minus[j]
                 xpj = self.ss.x_plus[j]
-                dj = xpj - xmj  # d = x_plus - x_minus
-                omega = self.ss.gamma[j] * dj  # 等效涡量向量（单位强度下的正则化形式）
+                dj = xpj - xmj
+                omega = self.ss.gamma[j] * dj
 
-                # endpoint x_minus_query 的诱导速度
                 r_m = xmi - (0.5 * (xmj + xpj))
                 r2_m = r_m.dot(r_m) + R2
                 denom_m = r2_m * ti.sqrt(r2_m) + 1e-12
                 ui_m += inv4pi * omega.cross(r_m) / denom_m
 
-                # endpoint x_plus_query 的诱导速度
                 r_p = xpi - (0.5 * (xmj + xpj))
                 r2_p = r_p.dot(r_p) + R2
                 denom_p = r2_p * ti.sqrt(r2_p) + 1e-12
                 ui_p += inv4pi * omega.cross(r_p) / denom_p
+
+            out_minus[i] = ui_m
+            out_plus[i] = ui_p
+
+    @ti.kernel
+    def _compute_velocity_at_factor_finite(
+        self,
+        factor: float,
+        k_minus_in: ti.template(),
+        k_plus_in: ti.template(),
+        out_minus: ti.template(),
+        out_plus: ti.template(),
+        reg_radius: float,
+    ):
+        """RK4 子步：论文式 (6) 与 _compute_endpoint_velocity_bs_finite 一致。"""
+        inv4pi = 1.0 / (4.0 * ti.math.pi)
+        R2 = reg_radius * reg_radius
+        n = self.ss.segment_num[None]
+
+        for i in range(n):
+            if self.ss.active[i] != 1:
+                continue
+
+            xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
+            xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
+
+            ui_m = self._segment_background(i)
+            ui_p = self._segment_background(i)
+
+            for j in range(n):
+                if j == i or self.ss.active[j] != 1:
+                    continue
+
+                am = self.ss.x_minus[j]
+                ap = self.ss.x_plus[j]
+                d = ap - am
+                Lj = d.norm() + 1e-8
+                Gamma = self.ss.gamma[j] * Lj
+
+                apx = ap - xmi
+                ambx = am - xmi
+                u1 = apx / (apx.norm() + reg_radius + 1e-12)
+                u2 = ambx / (ambx.norm() + reg_radius + 1e-12)
+                sc = (u1 - u2).dot(d)
+                cr = ambx.cross(apx)
+                cross_sq = cr.dot(cr) + R2
+                ui_m += inv4pi * Gamma * sc / (cross_sq + 1e-20) * cr
+
+                apxp = ap - xpi
+                ambxp = am - xpi
+                u1p = apxp / (apxp.norm() + reg_radius + 1e-12)
+                u2p = ambxp / (ambxp.norm() + reg_radius + 1e-12)
+                scp = (u1p - u2p).dot(d)
+                crp = ambxp.cross(apxp)
+                cross_sqp = crp.dot(crp) + R2
+                ui_p += inv4pi * Gamma * scp / (cross_sqp + 1e-20) * crp
 
             out_minus[i] = ui_m
             out_plus[i] = ui_p
@@ -758,8 +1153,8 @@ class SegmentSolver:
             xp_new = c_new + 0.5 * L_new * t_new
             g_new = w_norm / (L_new + 1e-8)
 
-            out_xm.append(xm_new.astype(np.float32))
-            out_xp.append(xp_new.astype(np.float32))
+            out_xm.append(xm_new)
+            out_xp.append(xp_new)
             out_g.append(np.float32(g_new))
             out_a.append(np.float32(min(age[i], age[j])))
             out_t.append(seg_type[i])
@@ -903,4 +1298,7 @@ class SegmentSolver:
         self.split_segments()
         self.merge_segments()
         self.delete_weak_segments()
+        # 初始脉冲只生效一个时间步
+        if self._use_leapfrog_initial_impulse[None] == 1:
+            self._decay_impulse_kernel()
         #self.cull_segments()
