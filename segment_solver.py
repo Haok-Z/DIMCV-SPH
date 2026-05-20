@@ -9,6 +9,7 @@ def _segment_cfg_biot_savart_is_finite(cfg) -> bool:
     SegmentConfiguration.biotSavartModel:
     - finite_segment（默认）：有限长直线段 Biot–Savart 闭式（与 Vortex Segment 类论文常用离散一致）
     - blob_center：段中点 + 平滑 blob（旧实现，数值更钝、易调）
+    - point_vortex_2d：二维点涡式 (7)，见 _segment_cfg_use_2d_point_vortex_bs
     """
     m = cfg.get_cfg("biotSavartModel", "finite_segment")
     if m is None:
@@ -16,7 +17,21 @@ def _segment_cfg_biot_savart_is_finite(cfg) -> bool:
     m = str(m).lower().strip()
     if m in ("blob", "blob_center", "center_blob", "lumped"):
         return False
+    if m in ("point_vortex_2d", "2d_point", "eq7", "formula_7", "2d"):
+        return False
     return True
+
+
+def _segment_cfg_use_2d_point_vortex_bs(cfg, spatial_dim: int) -> bool:
+    """TOG2021 式 (7)：u = Γ/(2π) e_z × (x−x_j) / (|x−x_j|²+R²)。"""
+    m = cfg.get_cfg("biotSavartModel", None)
+    if m is not None:
+        m = str(m).lower().strip()
+        if m in ("point_vortex_2d", "2d_point", "eq7", "formula_7", "2d"):
+            return True
+        if m in ("finite_segment", "finite", "3d", "blob", "blob_center"):
+            return False
+    return spatial_dim == 2
 
 
 @ti.data_oriented
@@ -34,6 +49,10 @@ class SegmentSolver:
         )
         self.u_inf = ti.Vector.field(3, dtype=float, shape=())
         self.u_inf.from_numpy(self.background_velocity)
+        self._grav_add = ti.Vector.field(3, dtype=float, shape=())
+        gv = self._build_segment_gravity_velocity_numpy()
+        # Taichi Vector(dtype=float) 为 f32；from_numpy 用 f64 会触发 Assign may lose precision 警告
+        self._grav_add.from_numpy(np.asarray(gv, dtype=np.float32))
         # Leapfrog 两个环可选的独立背景速度（默认关闭）
         self._use_leapfrog_ring_bg = ti.field(dtype=ti.i32, shape=())
         self._ring1_seg_type = ti.field(dtype=ti.i32, shape=())
@@ -75,23 +94,95 @@ class SegmentSolver:
         self.boundary = SegmentBoundaryHandler(self.ss)
         self.has_boundary = self.boundary.enable_boundary_injection
         self._bs_finite = _segment_cfg_biot_savart_is_finite(self.ss.cfg)
+        self._bs_2d_point = _segment_cfg_use_2d_point_vortex_bs(
+            self.ss.cfg, self.ss.dim
+        )
+        sch = str(self.ss.cfg.get_cfg("boundaryInjectionSchedule", "each_step") or "each_step").lower().strip()
+        if sch in ("init", "initialize", "initialize_only", "once", "static", "static_once"):
+            self._boundary_schedule = "initialize_only"
+        else:
+            self._boundary_schedule = "each_step"
+        self._boundary_one_shot_done = False
+        self._sim_step_index = 0
+        self._emitter_rng = np.random.default_rng(
+            int(self.ss.cfg.get_cfg("emitterSeed", 0) or 0)
+        )
 
-        self.v_minus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
-        self.v_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
+        _vd = self.ss.dim
+        self.v_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.v_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
 
         # RK4 需要的中间导数（端点速度）
-        self.k1_minus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
-        self.k2_minus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
-        self.k3_minus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
-        self.k4_minus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
+        self.k1_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.k2_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.k3_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.k4_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
 
-        self.k1_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
-        self.k2_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
-        self.k3_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
-        self.k4_plus = ti.Vector.field(3, dtype=float, shape=self.ss.segment_max_num)
+        self.k1_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.k2_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.k3_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.k4_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+
+        self._fz_a = ti.field(dtype=ti.i32, shape=())
+        self._fz_b = ti.field(dtype=ti.i32, shape=())
+        self._fz_c = ti.field(dtype=ti.i32, shape=())
+        self._fz_d = ti.field(dtype=ti.i32, shape=())
+        _fz_list: list[int] = []
+        if bool(self.ss.cfg.get_cfg("advectFreezeBoundarySegments", False)):
+            _fz_list.append(int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2)))
+        _extras = self.ss.cfg.get_cfg("advectFreezeSegmentTypeIds", None)
+        if _extras is not None:
+            for _x in _extras:
+                _xi = int(_x)
+                if _xi not in _fz_list and len(_fz_list) < 4:
+                    _fz_list.append(_xi)
+        while len(_fz_list) < 4:
+            _fz_list.append(-1)
+        self._fz_a[None] = _fz_list[0]
+        self._fz_b[None] = _fz_list[1]
+        self._fz_c[None] = _fz_list[2]
+        self._fz_d[None] = _fz_list[3]
+
+    @ti.func
+    def _advect_frozen(self, st: int) -> ti.i32:
+        """若为 1，则该 seg_type 不参与 RK4/Euler 端点推进（仍参与 BS 诱导速度）。"""
+        # Taichi：@ti.func 内不能在非 static 的 if 里 return，只能末尾单一 return
+        out = 0
+        if self._fz_a[None] != -1 and st == self._fz_a[None]:
+            out = 1
+        if self._fz_b[None] != -1 and st == self._fz_b[None]:
+            out = 1
+        if self._fz_c[None] != -1 and st == self._fz_c[None]:
+            out = 1
+        if self._fz_d[None] != -1 and st == self._fz_d[None]:
+            out = 1
+        return out
 
     @ti.func
     def _segment_background(self, i: int):
+        if ti.static(self.ss.dim == 2):
+            u = ti.Vector([self.u_inf[None][0], self.u_inf[None][1]])
+            if self._use_leapfrog_ring_bg[None] == 1:
+                st = self.ss.seg_type[i]
+                if st == self._ring1_seg_type[None]:
+                    u = u + ti.Vector([
+                        self._ring1_u_inf[None][0], self._ring1_u_inf[None][1]
+                    ])
+                elif st == self._ring2_seg_type[None]:
+                    u = u + ti.Vector([
+                        self._ring2_u_inf[None][0], self._ring2_u_inf[None][1]
+                    ])
+            if self._use_leapfrog_initial_impulse[None] == 1:
+                st = self.ss.seg_type[i]
+                if st == self._ring1_seg_type[None]:
+                    u = u + ti.Vector([
+                        self._ring1_impulse[None][0], self._ring1_impulse[None][1]
+                    ])
+                elif st == self._ring2_seg_type[None]:
+                    u = u + ti.Vector([
+                        self._ring2_impulse[None][0], self._ring2_impulse[None][1]
+                    ])
+            return u + ti.Vector([self._grav_add[None][0], self._grav_add[None][1]])
         u = self.u_inf[None]
         if self._use_leapfrog_ring_bg[None] == 1:
             st = self.ss.seg_type[i]
@@ -105,7 +196,23 @@ class SegmentSolver:
                 u = u + self._ring1_impulse[None]
             elif st == self._ring2_seg_type[None]:
                 u = u + self._ring2_impulse[None]
-        return u
+        return u + self._grav_add[None]
+
+    def _build_segment_gravity_velocity_numpy(self) -> np.ndarray:
+        """
+        将重力映射为端点对流中的常速度偏置（m/s），与 Biot–Savart 诱导速度叠加。
+        优先 SegmentConfiguration.segmentGravitationVelocity；
+        否则用 Configuration.gravitation * segmentGravitationScale。
+        """
+        raw = self.ss.cfg.get_cfg("segmentGravitationVelocity", None)
+        if raw is not None:
+            return np.array(raw, dtype=np.float32).reshape(3)
+        scale = float(self.ss.cfg.get_cfg("segmentGravitationScale", 0.0))
+        if scale == 0.0:
+            return np.zeros(3, dtype=np.float32)
+        conf = self.ss.cfg.get_configuration_dict() if hasattr(self.ss.cfg, "get_configuration_dict") else {}
+        g_acc = np.array(conf.get("gravitation", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(3)
+        return (g_acc * np.float32(scale)).astype(np.float32)
 
     @ti.kernel
     def _decay_impulse_kernel(self):
@@ -119,8 +226,27 @@ class SegmentSolver:
 
     def initialize(self):
         self.ss.clear()
+        self._boundary_one_shot_done = False
         self.seed_initial_segments()
         self.ss.update_segment_geometry()
+        if self.has_boundary and self._boundary_schedule == "initialize_only":
+            self._run_boundary_injection_pipeline(strip_committed_first=False)
+            self._boundary_one_shot_done = True
+
+    def _run_boundary_injection_pipeline(self, strip_committed_first: bool):
+        """
+        边界虚拟段：可选先剥旧类型，再更新位姿、生成候选、K、RHS、求解、提交。
+        """
+        if not self.has_boundary:
+            return
+        if strip_committed_first:
+            self._strip_segments_of_type(int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2)))
+        self.boundary.update_boundary_pose()
+        self.boundary.generate_boundary_segments()
+        self.boundary.compute_k_matrix()
+        self.boundary.compute_rhs()
+        self.boundary.solve_linear_system()
+        self.boundary.commit_boundary_segments()
 
     def seed_initial_segments(self):
         """
@@ -153,9 +279,19 @@ class SegmentSolver:
             self._seed_leapfrog_rings()
             return
 
+        if init_type in ("random_uniform", "random_cloud"):
+            self._seed_random_uniform_segments()
+            return
+
+        if init_type in ("parallel_x_layers", "parallel_x_filaments_grid", "x_parallel_layers"):
+            self._seed_parallel_x_layers_filaments()
+            return
+
         if init_type != "ring":
             raise NotImplementedError(
-                f"initType={init_type} 尚未实现（当前支持 ring / triple_parallel_filaments_x / v_bundle_pair / leapfrog_rings / none）"
+                f"initType={init_type} 尚未实现（当前支持 ring / triple_parallel_filaments_x / "
+                f"v_bundle_pair / leapfrog_rings / random_uniform / random_cloud / "
+                f"parallel_x_layers / none）"
             )
 
         # 读取初始化参数
@@ -240,6 +376,236 @@ class SegmentSolver:
             return
 
         self._seed_segments_kernel(offset, n_new, x_minus[:n_new], x_plus[:n_new], gamma[:n_new], seg_type)
+        self.ss.segment_num[None] = offset + n_new
+
+    def _seed_random_uniform_segments(self):
+        """
+        在域内随机放置短线段：随机中点、随机朝向、长度 ∈ [Lmin, Lmax]，γ 默认全 0。
+        用于 SPH–涡段耦合：强度完全由后续沉积与演化给出。
+
+        SegmentConfiguration:
+        - randomSegmentNum（默认 4096）
+        - randomSegmentLengthMin / randomSegmentLengthMax（默认 0.015 / 0.04）
+        - randomPositionMargin（默认 0.05）：相对 domain 的内缩，避免端点出域
+        - randomGammaInitial（默认 0.0）
+        - randomSegmentSeed：种子；若缺省则用 initPerturbSeed，再无则 0
+        - initSegmentTypeId
+        """
+        n_seg = int(self.ss.cfg.get_cfg("randomSegmentNum", 4096))
+        n_seg = max(1, n_seg)
+        L0 = float(self.ss.cfg.get_cfg("randomSegmentLengthMin", 0.015))
+        L1 = float(self.ss.cfg.get_cfg("randomSegmentLengthMax", 0.04))
+        if L1 < L0:
+            L0, L1 = L1, L0
+        margin = float(self.ss.cfg.get_cfg("randomPositionMargin", 0.05))
+        g0 = float(self.ss.cfg.get_cfg("randomGammaInitial", 0.0))
+        seg_type = int(self.ss.cfg.get_cfg("initSegmentTypeId", 0))
+
+        seed = self.ss.cfg.get_cfg("randomSegmentSeed", None)
+        if seed is None:
+            seed = self.ss.cfg.get_cfg("initPerturbSeed", None)
+        if seed is None:
+            seed = 0
+        rng = np.random.default_rng(int(seed))
+
+        lo = self.ss.domain_start.astype(np.float64) + margin + 0.5 * L1
+        hi = self.ss.domain_end.astype(np.float64) - margin - 0.5 * L1
+        if np.any(lo >= hi):
+            raise ValueError(
+                "random_uniform: domain too small for randomPositionMargin and max segment length; "
+                "reduce margin or randomSegmentLengthMax."
+            )
+
+        x_minus = np.zeros((n_seg, 3), dtype=np.float32)
+        x_plus = np.zeros((n_seg, 3), dtype=np.float32)
+        gamma = np.full((n_seg,), g0, dtype=np.float32)
+
+        for k in range(n_seg):
+            center = rng.uniform(lo, hi).astype(np.float32)
+            if self.ss.dim == 2:
+                q = rng.standard_normal(2).astype(np.float64)
+                nq = float(np.linalg.norm(q))
+                if nq < 1e-8:
+                    t2 = np.array([1.0, 0.0], dtype=np.float32)
+                else:
+                    t2 = (q / nq).astype(np.float32)
+                L = float(rng.uniform(L0, L1))
+                half2 = 0.5 * L * t2
+                x_minus[k] = np.array([center[0] - half2[0], center[1] - half2[1], 0.0],
+                                      dtype=np.float32)
+                x_plus[k] = np.array([center[0] + half2[0], center[1] + half2[1], 0.0],
+                                     dtype=np.float32)
+                continue
+            q = rng.standard_normal(3).astype(np.float64)
+            nq = float(np.linalg.norm(q))
+            if nq < 1e-8:
+                t = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            else:
+                t = (q / nq).astype(np.float32)
+            L = float(rng.uniform(L0, L1))
+            half = 0.5 * L * t
+            x_minus[k] = center - half
+            x_plus[k] = center + half
+
+        offset = int(self.ss.segment_num[None])
+        if offset >= int(self.ss.segment_max_num):
+            return
+
+        n_new = min(n_seg, int(self.ss.segment_max_num) - offset)
+        if n_new <= 0:
+            return
+
+        self._seed_segments_kernel(
+            offset, n_new, x_minus[:n_new], x_plus[:n_new], gamma[:n_new], seg_type
+        )
+        self.ss.segment_num[None] = offset + n_new
+
+    def _seed_parallel_x_layers_filaments(self):
+        """
+        在 SegmentConfiguration.domainStart/End 盒子内，沿 +X 方向铺许多短涡段，
+        组成 n 条平行线；共 L 层（层与层沿可选轴分开）。
+
+        SegmentConfiguration:
+        - parallelXLayers（默认 3）：层数 L
+        - parallelXFilamentsPerLayer（默认 8）：每层平行线数 n（沿层法向的垂直方向均匀排布）
+        - parallelXSegmentsPerLine（默认 24）：每条线沿 x 切成多少段
+        - parallelXSegmentGap（默认 0.0）：相邻两段在 x 上的间隙（上一段 x_plus 到下一段 x_minus 的距离）；
+          段长 L = (可用 x 跨度 − (M−1)×gap) / M；gap=0 时与原先首尾相接一致
+        - parallelXLayerAxis（默认 "z"）：层间分离轴，"z" 表示不同 z 平面为不同层，平行线在 y 向排开；
+          "y" 则不同 y 为层，线在 z 向排开
+        - parallelXMargin（默认 0.06）：相对 domain 三轴内缩，避免段端点贴边
+        - parallelXFilamentGamma（默认 initGamma 或 0.0）
+        - parallelXGammaAlternateFilament（默认 true）：相邻平行线 γ 取反（可选打破对称）
+        - parallelXGammaAlternateLayer（默认 false）：相邻层 γ 再取反
+        - initSegmentTypeId
+        """
+        L = int(self.ss.cfg.get_cfg("parallelXLayers", 3))
+        n = int(self.ss.cfg.get_cfg("parallelXFilamentsPerLayer", 8))
+        M = int(self.ss.cfg.get_cfg("parallelXSegmentsPerLine", 24))
+        L = max(1, L)
+        n = max(1, n)
+        M = max(1, M)
+
+        margin = float(self.ss.cfg.get_cfg("parallelXMargin", 0.06))
+        g0 = float(self.ss.cfg.get_cfg("parallelXFilamentGamma", self.ss.cfg.get_cfg("initGamma", 0.0)))
+        seg_type = int(self.ss.cfg.get_cfg("initSegmentTypeId", 0))
+        layer_axis = str(self.ss.cfg.get_cfg("parallelXLayerAxis", "z") or "z").lower().strip()
+        alt_f = bool(self.ss.cfg.get_cfg("parallelXGammaAlternateFilament", True))
+        alt_L = bool(self.ss.cfg.get_cfg("parallelXGammaAlternateLayer", False))
+
+        lo = self.ss.domain_start.astype(np.float64) + margin
+        hi = self.ss.domain_end.astype(np.float64) - margin
+        if self.ss.dim == 2:
+            lo = np.array([lo[0], lo[1]], dtype=np.float64)
+            hi = np.array([hi[0], hi[1]], dtype=np.float64)
+        if lo[0] >= hi[0] or lo[1] >= hi[1]:
+            raise ValueError(
+                "parallel_x_layers: domain too small after parallelXMargin; reduce margin or enlarge domain."
+            )
+        if self.ss.dim == 3 and lo[2] >= hi[2]:
+            raise ValueError(
+                "parallel_x_layers: domain too small after parallelXMargin (z); reduce margin or enlarge domain."
+            )
+
+        span_x = float(hi[0] - lo[0])
+        gap_x = float(self.ss.cfg.get_cfg("parallelXSegmentGap", 0.0))
+        gap_x = max(0.0, gap_x)
+        if M > 1:
+            usable_x = span_x - float(M - 1) * gap_x
+        else:
+            usable_x = span_x
+        if usable_x <= 0.0:
+            raise ValueError(
+                "parallel_x_layers: parallelXSegmentGap too large for parallelXSegmentsPerLine and x-span; "
+                "reduce gap, reduce M, or widen domain (after margin)."
+            )
+        seg_len_x = usable_x / float(M)
+
+        total = L * n * M
+        x_minus = np.zeros((total, 3), dtype=np.float32)
+        x_plus = np.zeros((total, 3), dtype=np.float32)
+        gamma = np.zeros((total,), dtype=np.float32)
+
+        idx = 0
+        if self.ss.dim == 2:
+            # 2D：L 层沿 y，每层 n 条平行线（不同 y），段沿 +x，z = 0
+            ys_layer = np.linspace(float(lo[1]), float(hi[1]), L, dtype=np.float64)
+            ys_line = np.linspace(float(lo[1]), float(hi[1]), n, dtype=np.float64)
+            if L == 1:
+                ys_layer = ys_line
+            for li in range(L):
+                y_layer = float(ys_layer[li]) if L > 1 else float(lo[1])
+                for fi in range(n):
+                    yc = float(ys_line[fi]) if L == 1 else y_layer
+                    sgn = 1.0
+                    if alt_f and (fi % 2) == 1:
+                        sgn *= -1.0
+                    if alt_L and (li % 2) == 1:
+                        sgn *= -1.0
+                    g_line = float(sgn * g0)
+                    for k in range(M):
+                        x0 = float(lo[0] + float(k) * (seg_len_x + gap_x))
+                        x1 = float(x0 + seg_len_x)
+                        x_minus[idx] = np.array([x0, yc, 0.0], dtype=np.float32)
+                        x_plus[idx] = np.array([x1, yc, 0.0], dtype=np.float32)
+                        gamma[idx] = g_line
+                        idx += 1
+        elif layer_axis in ("y", "layer_y"):
+            # L 层：不同 y；每层 n 条线：不同 z
+            ys = np.linspace(float(lo[1]), float(hi[1]), L, dtype=np.float64)
+            zs = np.linspace(float(lo[2]), float(hi[2]), n, dtype=np.float64)
+            for li in range(L):
+                yc = float(ys[li])
+                for fi in range(n):
+                    zc = float(zs[fi])
+                    sgn = 1.0
+                    if alt_f and (fi % 2) == 1:
+                        sgn *= -1.0
+                    if alt_L and (li % 2) == 1:
+                        sgn *= -1.0
+                    g_line = float(sgn * g0)
+                    for k in range(M):
+                        x0 = float(lo[0] + float(k) * (seg_len_x + gap_x))
+                        x1 = float(x0 + seg_len_x)
+                        x_minus[idx] = np.array([x0, yc, zc], dtype=np.float32)
+                        x_plus[idx] = np.array([x1, yc, zc], dtype=np.float32)
+                        gamma[idx] = g_line
+                        idx += 1
+        else:
+            # 默认 "z"：L 层不同 z；每层 n 条线不同 y
+            zs = np.linspace(float(lo[2]), float(hi[2]), L, dtype=np.float64)
+            ys = np.linspace(float(lo[1]), float(hi[1]), n, dtype=np.float64)
+            for li in range(L):
+                zc = float(zs[li])
+                for fi in range(n):
+                    yc = float(ys[fi])
+                    sgn = 1.0
+                    if alt_f and (fi % 2) == 1:
+                        sgn *= -1.0
+                    if alt_L and (li % 2) == 1:
+                        sgn *= -1.0
+                    g_line = float(sgn * g0)
+                    for k in range(M):
+                        x0 = float(lo[0] + float(k) * (seg_len_x + gap_x))
+                        x1 = float(x0 + seg_len_x)
+                        x_minus[idx] = np.array([x0, yc, zc], dtype=np.float32)
+                        x_plus[idx] = np.array([x1, yc, zc], dtype=np.float32)
+                        gamma[idx] = g_line
+                        idx += 1
+
+        assert idx == total
+
+        offset = int(self.ss.segment_num[None])
+        if offset >= int(self.ss.segment_max_num):
+            return
+
+        n_new = min(total, int(self.ss.segment_max_num) - offset)
+        if n_new <= 0:
+            return
+
+        self._seed_segments_kernel(
+            offset, n_new, x_minus[:n_new], x_plus[:n_new], gamma[:n_new], seg_type
+        )
         self.ss.segment_num[None] = offset + n_new
 
     def _seed_triple_parallel_filaments_x(self):
@@ -606,12 +972,26 @@ class SegmentSolver:
     ):
         for k in range(n_new):
             i = offset + k
-            self.ss.x_minus[i] = ti.Vector([x_minus[k, 0], x_minus[k, 1], x_minus[k, 2]])
-            self.ss.x_plus[i] = ti.Vector([x_plus[k, 0], x_plus[k, 1], x_plus[k, 2]])
+            self.ss.set_segment_ends_from_ndarray_row(i, k, x_minus, x_plus)
             self.ss.gamma[i] = gamma[k]
             self.ss.active[i] = 1
             self.ss.age[i] = 0.0
             self.ss.seg_type[i] = seg_type
+
+    @ti.func
+    def _bs_velocity_2d_point_vortex(
+        self, x_query: ti.template(), x_vortex: ti.template(), Gamma: float, R2: float
+    ):
+        """
+        TOG2021 式 (7)：u^BS = Γ/(2π) e_z × (x−x_j) / (|x−x_j|²+R²)，xy 平面内速度。
+        """
+        inv2pi = 1.0 / (2.0 * ti.math.pi)
+        rx = x_query[0] - x_vortex[0]
+        ry = x_query[1] - x_vortex[1]
+        r2 = rx * rx + ry * ry + 1e-12
+        ux = inv2pi * Gamma * (-ry) / (r2 + R2)
+        uy = inv2pi * Gamma * (rx) / (r2 + R2)
+        return ti.Vector([ux, uy])
 
     def compute_endpoint_velocity(self):
         """
@@ -627,16 +1007,18 @@ class SegmentSolver:
         - 第一版可用 O(N^2) 直接求和
         - 后续可用网格或多极近似进行加速
         """
-        if self._bs_finite:
+        if self._bs_2d_point:
+            self._compute_endpoint_velocity_bs_2d_point(float(self.reg_radius))
+        elif self._bs_finite:
             self._compute_endpoint_velocity_bs_finite(float(self.reg_radius))
-            n = int(self.ss.segment_num[None])
-            v_m = self.v_minus.to_numpy()[:n]
-            v_p = self.v_plus.to_numpy()[:n]
-
-            print("v_minus[0:5] =", v_m[:5])
-            print("v_plus[0:5]  =", v_p[:5])
-            print("speed_minus mean/max =", (v_m**2).sum(axis=1).mean()**0.5, ((v_m**2).sum(axis=1).max())**0.5)
-            print("speed_plus  mean/max =", (v_p**2).sum(axis=1).mean()**0.5, ((v_p**2).sum(axis=1).max())**0.5)
+            if bool(self.ss.cfg.get_cfg("debugPrintEndpointVelocity", False)):
+                n = int(self.ss.segment_num[None])
+                v_m = self.v_minus.to_numpy()[:n]
+                v_p = self.v_plus.to_numpy()[:n]
+                print("v_minus[0:5] =", v_m[:5])
+                print("v_plus[0:5]  =", v_p[:5])
+                print("speed_minus mean/max =", (v_m**2).sum(axis=1).mean()**0.5, ((v_m**2).sum(axis=1).max())**0.5)
+                print("speed_plus  mean/max =", (v_p**2).sum(axis=1).mean()**0.5, ((v_p**2).sum(axis=1).max())**0.5)
         else:
             self._compute_endpoint_velocity_bs_blob(float(self.reg_radius))
 
@@ -684,6 +1066,44 @@ class SegmentSolver:
             self.v_plus[i] = ui_p
 
     @ti.kernel
+    def _compute_endpoint_velocity_bs_2d_point(self, reg_radius: float):
+        """
+        TOG2021 式 (7)：二维点涡 u^BS = Γ/(2π) e_z×(x−x_j)/(|x−x_j|²+R²)。
+        每段以中点 x_j 与 Γ_j = γ_j L_j 参与求和（式 (8) 的离散项）。
+        """
+        R2 = reg_radius * reg_radius
+        n = self.ss.segment_num[None]
+
+        for i in range(n):
+            if self.ss.active[i] != 1:
+                continue
+
+            xmi = self.ss.x_minus[i]
+            xpi = self.ss.x_plus[i]
+            ui_m = self._segment_background(i)
+            ui_p = self._segment_background(i)
+
+            for j in range(n):
+                if j == i or self.ss.active[j] != 1:
+                    continue
+
+                am = self.ss.x_minus[j]
+                ap = self.ss.x_plus[j]
+                cj = 0.5 * (am + ap)
+                Lj = (ap - am).norm() + 1e-8
+                Gamma = self.ss.gamma[j] * Lj
+
+                bs_m = self._bs_velocity_2d_point_vortex(xmi, cj, Gamma, R2)
+                bs_p = self._bs_velocity_2d_point_vortex(xpi, cj, Gamma, R2)
+                ui_m[0] += bs_m[0]
+                ui_m[1] += bs_m[1]
+                ui_p[0] += bs_p[0]
+                ui_p[1] += bs_p[1]
+
+            self.v_minus[i] = ui_m
+            self.v_plus[i] = ui_p
+
+    @ti.kernel
     def _compute_endpoint_velocity_bs_finite(self, reg_radius: float):
         """
         论文 TOG2021 式 (6)：三维涡段云上的 Biot–Savart（Weißmann & Pinkall 形式）。
@@ -691,7 +1111,7 @@ class SegmentSolver:
         u_j^BS(x) = Γ_j/(4π) * [ ( (x_j^+−x)/(|x_j^+−x|+R) − (x_j^−−x)/(|x_j^−−x|+R) ) · (x_j^+−x_j^−) ]
                               * [ (x_j^−−x)×(x_j^+−x) / ( |(x_j^−−x)×(x_j^+−x)|^2 + R^2 ) ]
 
-        注意：同节式 (7) 为二维点涡，不用于本三维求解器。
+        三维流用式 (6)；二维请用 biotSavartModel: point_vortex_2d（式 (7)）。
 
         数据约定：段上涡向量取 gamma*(x^+−x^−)，则 Γ_j = gamma_j * L_j。
         """
@@ -746,6 +1166,106 @@ class SegmentSolver:
             self.v_minus[i] = ui_m
             self.v_plus[i] = ui_p
 
+    def accumulate_bs_velocity_at_fluid_particles(self, ps, out_u, reg_radius: float):
+        """
+        For each fluid particle at ``ps.x[p]``, sum induced velocity from all active
+        segments using the same finite-segment Biot–Savart as endpoint velocity.
+
+        Non-fluid indices are zeroed. Requires ``biotSavartModel: finite_segment``.
+        """
+        if self._bs_2d_point:
+            self._accumulate_bs_at_particles_2d_point(
+                ps.particle_num,
+                ps.x,
+                ps.material,
+                int(ps.material_fluid),
+                out_u,
+                float(reg_radius),
+            )
+            return
+        if not self._bs_finite:
+            raise NotImplementedError(
+                "accumulate_bs_velocity_at_fluid_particles requires finite_segment or point_vortex_2d"
+            )
+        self._accumulate_bs_at_particles_finite(
+            ps.particle_num,
+            ps.x,
+            ps.material,
+            int(ps.material_fluid),
+            out_u,
+            float(reg_radius),
+        )
+
+    @ti.kernel
+    def _accumulate_bs_at_particles_2d_point(
+        self,
+        particle_num: ti.template(),
+        x: ti.template(),
+        material: ti.template(),
+        mf: ti.i32,
+        out_u: ti.template(),
+        reg_radius: float,
+    ):
+        R2 = reg_radius * reg_radius
+        nseg = self.ss.segment_num[None]
+        for p in range(particle_num[None]):
+            out_u[p] = ti.Vector([0.0, 0.0, 0.0])
+            if material[p] != mf:
+                continue
+            xp_query = x[p]
+            ux = 0.0
+            uy = 0.0
+            for j in range(nseg):
+                if self.ss.active[j] != 1:
+                    continue
+                am = self.ss.x_minus[j]
+                ap = self.ss.x_plus[j]
+                cj = 0.5 * (am + ap)
+                Lj = (ap - am).norm() + 1e-8
+                Gamma = self.ss.gamma[j] * Lj
+                bsu = self._bs_velocity_2d_point_vortex(xp_query, cj, Gamma, R2)
+                ux += bsu[0]
+                uy += bsu[1]
+            out_u[p] = ti.Vector([ux, uy, 0.0])
+
+    @ti.kernel
+    def _accumulate_bs_at_particles_finite(
+        self,
+        particle_num: ti.template(),
+        x: ti.template(),
+        material: ti.template(),
+        mf: ti.i32,
+        out_u: ti.template(),
+        reg_radius: float,
+    ):
+        inv4pi = 1.0 / (4.0 * ti.math.pi)
+        R2 = reg_radius * reg_radius
+        nseg = self.ss.segment_num[None]
+        for p in range(particle_num[None]):
+            out_u[p] = ti.Vector([0.0, 0.0, 0.0])
+            if material[p] != mf:
+                continue
+            xp_query = x[p]
+            u = ti.Vector([0.0, 0.0, 0.0])
+            for j in range(nseg):
+                if self.ss.active[j] != 1:
+                    continue
+                am = self.ss.x_minus[j]
+                ap = self.ss.x_plus[j]
+                d = ap - am
+                Lj = d.norm() + 1e-8
+                Gamma = self.ss.gamma[j] * Lj
+
+                apx = ap - xp_query
+                ambx = am - xp_query
+                u1 = apx / (apx.norm() + reg_radius + 1e-12)
+                u2 = ambx / (ambx.norm() + reg_radius + 1e-12)
+                sc = (u1 - u2).dot(d)
+                cr = ambx.cross(apx)
+                cross_sq = cr.dot(cr) + R2
+                u += inv4pi * Gamma * sc / (cross_sq + 1e-20) * cr
+            out_u[p] = u
+
     def advect_segments_rk4(self):
         """
         TODO：
@@ -779,6 +1299,8 @@ class SegmentSolver:
     def _advect_segments_euler_placeholder(self):
         for i in range(self.ss.segment_num[None]):
             if self.ss.active[i] == 1:
+                if self._advect_frozen(self.ss.seg_type[i]) == 1:
+                    continue
                 self.ss.x_minus[i] += self.dt * self.v_minus[i]
                 self.ss.x_plus[i] += self.dt * self.v_plus[i]
                 self.ss.gamma[i] *= self.gamma_decay
@@ -802,7 +1324,11 @@ class SegmentSolver:
         out_minus,
         out_plus,
     ):
-        if self._bs_finite:
+        if self._bs_2d_point:
+            self._compute_velocity_at_factor_2d_point(
+                factor, k_minus_in, k_plus_in, out_minus, out_plus, float(self.reg_radius)
+            )
+        elif self._bs_finite:
             self._compute_velocity_at_factor_finite(
                 factor, k_minus_in, k_plus_in, out_minus, out_plus, float(self.reg_radius)
             )
@@ -810,6 +1336,50 @@ class SegmentSolver:
             self._compute_velocity_at_factor_blob(
                 factor, k_minus_in, k_plus_in, out_minus, out_plus
             )
+
+    @ti.kernel
+    def _compute_velocity_at_factor_2d_point(
+        self,
+        factor: float,
+        k_minus_in: ti.template(),
+        k_plus_in: ti.template(),
+        out_minus: ti.template(),
+        out_plus: ti.template(),
+        reg_radius: float,
+    ):
+        """RK4 子步：在 x + factor*dt*k 处用论文式 (7) 求诱导速度。"""
+        R2 = reg_radius * reg_radius
+        n = self.ss.segment_num[None]
+
+        for i in range(n):
+            if self.ss.active[i] != 1:
+                continue
+
+            xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
+            xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
+
+            ui_m = self._segment_background(i)
+            ui_p = self._segment_background(i)
+
+            for j in range(n):
+                if j == i or self.ss.active[j] != 1:
+                    continue
+
+                am = self.ss.x_minus[j]
+                ap = self.ss.x_plus[j]
+                cj = 0.5 * (am + ap)
+                Lj = (ap - am).norm() + 1e-8
+                Gamma = self.ss.gamma[j] * Lj
+
+                bs_m = self._bs_velocity_2d_point_vortex(xmi, cj, Gamma, R2)
+                bs_p = self._bs_velocity_2d_point_vortex(xpi, cj, Gamma, R2)
+                ui_m[0] += bs_m[0]
+                ui_m[1] += bs_m[1]
+                ui_p[0] += bs_p[0]
+                ui_p[1] += bs_p[1]
+
+            out_minus[i] = ui_m
+            out_plus[i] = ui_p
 
     @ti.kernel
     def _compute_velocity_at_factor_blob(
@@ -925,6 +1495,8 @@ class SegmentSolver:
         for i in range(n):
             if self.ss.active[i] != 1:
                 continue
+            if self._advect_frozen(self.ss.seg_type[i]) == 1:
+                continue
 
             self.ss.x_minus[i] += (self.dt / 6.0) * (
                 self.k1_minus[i] + 2.0 * self.k2_minus[i] + 2.0 * self.k3_minus[i] + self.k4_minus[i]
@@ -955,6 +1527,11 @@ class SegmentSolver:
 
         keep = (active == 1) & (np.abs(gamma) >= float(self.delete_gamma_threshold))
 
+        ofx = self.ss.cfg.get_cfg("outflowDeleteCenterBeyondX", None)
+        if ofx is not None:
+            mid_x = 0.5 * (x_minus[:, 0] + x_plus[:, 0])
+            keep &= mid_x <= float(ofx)
+
         # 可选：按年龄删除
         max_age = self.ss.cfg.get_cfg("deleteMaxAge", None)
         if max_age is not None:
@@ -963,10 +1540,15 @@ class SegmentSolver:
         # 可选：删除域外段（要求两端点都在域内）
         delete_outside = bool(self.ss.cfg.get_cfg("deleteOutsideDomain", False))
         if delete_outside:
-            lo = self.ss.domain_start.astype(np.float32)
-            hi = self.ss.domain_end.astype(np.float32)
-            in_m = np.all((x_minus >= lo[None, :]) & (x_minus <= hi[None, :]), axis=1)
-            in_p = np.all((x_plus >= lo[None, :]) & (x_plus <= hi[None, :]), axis=1)
+            d = self.ss.dim
+            lo = self.ss.domain_start.astype(np.float32)[:d]
+            hi = self.ss.domain_end.astype(np.float32)[:d]
+            in_m = np.all(
+                (x_minus[:, :d] >= lo[None, :]) & (x_minus[:, :d] <= hi[None, :]), axis=1
+            )
+            in_p = np.all(
+                (x_plus[:, :d] >= lo[None, :]) & (x_plus[:, :d] <= hi[None, :]), axis=1
+            )
             keep &= (in_m & in_p)
 
         idx = np.nonzero(keep)[0]
@@ -1001,13 +1583,31 @@ class SegmentSolver:
         - 追加新段 [m, x_plus]
         - 按守恒策略复制或重分配 gamma
         """
+        if not bool(self.ss.cfg.get_cfg("enableSplitSegments", True)):
+            return
         old_n = int(self.ss.segment_num[None])
         if old_n <= 0:
             return
-        self._split_segments_kernel(old_n, float(self.split_len_threshold))
+        skip = self.ss.cfg.get_cfg("splitSkipSegmentTypeIds", None)
+        if skip is None or (isinstance(skip, (list, tuple)) and len(skip) == 0):
+            sa, sb, sc, sd = -1, -1, -1, -1
+        else:
+            ids = [int(x) for x in skip][:4]
+            while len(ids) < 4:
+                ids.append(-1)
+            sa, sb, sc, sd = ids[0], ids[1], ids[2], ids[3]
+        self._split_segments_kernel(old_n, float(self.split_len_threshold), sa, sb, sc, sd)
 
     @ti.kernel
-    def _split_segments_kernel(self, old_n: int, split_len_threshold: float):
+    def _split_segments_kernel(
+        self,
+        old_n: int,
+        split_len_threshold: float,
+        skip_type_a: int,
+        skip_type_b: int,
+        skip_type_c: int,
+        skip_type_d: int,
+    ):
         """
         分裂策略（论文式(12)的最小实现）：
         - 仅处理 old_n 范围内原有段，避免本次新增段再次被处理
@@ -1017,12 +1617,23 @@ class SegmentSolver:
           3) 追加新段 [m, x_plus_old]
         - 新段继承 gamma / seg_type，age 置 0
         - 若容量不足则跳过追加（原段仍会被截断到一半）
+        - skip_type_*：若为 != -1 且 seg_type 等于其中之一，则不对该段分裂（用于边界虚拟段等）
         """
         max_n = self.ss.segment_max_num
         for i in range(old_n):
             if self.ss.active[i] != 1:
                 continue
             if self.ss.length[i] <= split_len_threshold:
+                continue
+
+            st = self.ss.seg_type[i]
+            if skip_type_a != -1 and st == skip_type_a:
+                continue
+            if skip_type_b != -1 and st == skip_type_b:
+                continue
+            if skip_type_c != -1 and st == skip_type_c:
+                continue
+            if skip_type_d != -1 and st == skip_type_d:
                 continue
 
             xm = self.ss.x_minus[i]
@@ -1068,6 +1679,8 @@ class SegmentSolver:
         - 方向判据满足（近反向或你选定的判据）
         - 可选：gamma 兼容性判据
         """
+        if not bool(self.ss.cfg.get_cfg("enableMergeSegments", True)):
+            return
         n = int(self.ss.segment_num[None])
         if n <= 1:
             return
@@ -1106,6 +1719,9 @@ class SegmentSolver:
             for j in range(i + 1, n):
                 if active[j] != 1 or used[j]:
                     continue
+                if bool(self.ss.cfg.get_cfg("mergeRequireSameSegmentType", False)):
+                    if int(seg_type[i]) != int(seg_type[j]):
+                        continue
                 d2 = float(np.sum((ci - center[j]) ** 2))
                 if d2 > merge_dist * merge_dist:
                     continue
@@ -1188,8 +1804,7 @@ class SegmentSolver:
             self.ss.active[i] = 0
 
         for i in range(new_n):
-            self.ss.x_minus[i] = ti.Vector([x_minus[i, 0], x_minus[i, 1], x_minus[i, 2]])
-            self.ss.x_plus[i] = ti.Vector([x_plus[i, 0], x_plus[i, 1], x_plus[i, 2]])
+            self.ss.set_segment_ends_from_ndarray_row(i, i, x_minus, x_plus)
             self.ss.gamma[i] = gamma[i]
             self.ss.age[i] = age[i]
             self.ss.seg_type[i] = seg_type[i]
@@ -1274,6 +1889,122 @@ class SegmentSolver:
         self._overwrite_segments_kernel(new_n, out_xm, out_xp, out_g, out_a, out_t)
         self.ss.segment_num[None] = new_n
 
+    def _strip_segments_of_type(self, type_id: int):
+        n = int(self.ss.segment_num[None])
+        if n <= 0:
+            return
+        x_minus = self.ss.x_minus.to_numpy()[:n].astype(np.float32)
+        x_plus = self.ss.x_plus.to_numpy()[:n].astype(np.float32)
+        gamma = self.ss.gamma.to_numpy()[:n].astype(np.float32)
+        active = self.ss.active.to_numpy()[:n].astype(np.int32)
+        age = self.ss.age.to_numpy()[:n].astype(np.float32)
+        seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
+        if not np.any((active == 1) & (seg_type == int(type_id))):
+            return
+        keep = (active == 1) & (seg_type != int(type_id))
+        idx = np.nonzero(keep)[0]
+        new_n = int(idx.size)
+        if new_n <= 0:
+            self._clear_active_kernel(n)
+            self.ss.segment_num[None] = 0
+            return
+        self._overwrite_segments_kernel(
+            new_n,
+            x_minus[idx],
+            x_plus[idx],
+            gamma[idx],
+            age[idx],
+            seg_type[idx],
+        )
+        self.ss.segment_num[None] = new_n
+
+    def _emit_inlet_segments(self):
+        if not bool(self.ss.cfg.get_cfg("emitterEnabled", False)):
+            return
+        interval = max(1, int(self.ss.cfg.get_cfg("emitterIntervalSteps", 1)))
+        if int(self._sim_step_index) % interval != 0:
+            return
+
+        use_fe = bool(self.ss.cfg.get_cfg("emitterUseFluidEmitterLayout", True))
+        emitters = self.ss.cfg.get_inflow() if hasattr(self.ss.cfg, "get_inflow") else []
+        if use_fe and len(emitters) > 0:
+            e0 = emitters[0]
+            c = np.array(e0["squareCenter"], dtype=np.float64)
+            s = np.array(e0["squareSize"], dtype=np.float64)
+            lo = c - 0.5 * s
+            hi = c + 0.5 * s
+            if float(s[0]) < 1e-8:
+                x_emit = float(self.ss.cfg.get_cfg("emitterPlaneInsetX", 0.02))
+            else:
+                x_emit = float(0.5 * (lo[0] + hi[0]))
+            y0, y1 = float(lo[1]), float(hi[1])
+            z0, z1 = float(lo[2]), float(hi[2])
+        else:
+            x_emit = float(self.ss.cfg.get_cfg("emitterX", 0.05))
+            y0 = float(self.ss.cfg.get_cfg("emitterY0", 0.1))
+            y1 = float(self.ss.cfg.get_cfg("emitterY1", 0.9))
+            z0 = float(self.ss.cfg.get_cfg("emitterZ0", 0.1))
+            z1 = float(self.ss.cfg.get_cfg("emitterZ1", 0.9))
+
+        # 沿 z 的涡线（固定 y、x），在 y 方向堆叠 ny 条；可选沿 z 再细分为多段。
+        ny = max(1, int(self.ss.cfg.get_cfg("emitterNy", self.ss.cfg.get_cfg("emitterMeshNy", 12))))
+        nz_sub = int(
+            self.ss.cfg.get_cfg(
+                "emitterSubdivisionsZ",
+                self.ss.cfg.get_cfg("emitterMeshNz", 1),
+            )
+        )
+        nz_sub = max(1, nz_sub)
+        g0 = float(self.ss.cfg.get_cfg("emitterGamma", 0.02))
+        st = int(self.ss.cfg.get_cfg("emitterSegTypeId", 0))
+        jy_cfg = self.ss.cfg.get_cfg("emitterYJitter", None)
+        if jy_cfg is not None:
+            jyz = float(jy_cfg)
+        else:
+            jyz = float(self.ss.cfg.get_cfg("emitterJitterYZ", 0.0))
+        alternate_y = bool(self.ss.cfg.get_cfg("emitterGammaAlternateY", True))
+
+        ys = np.linspace(y0, y1, ny, dtype=np.float32)
+        zs = np.linspace(z0, z1, nz_sub + 1, dtype=np.float32)
+        if jyz > 0.0:
+            ys = ys + self._emitter_rng.uniform(-jyz, jyz, size=ny).astype(np.float32)
+            ys = np.clip(ys, float(self.ss.domain_start[1]) + 1e-4, float(self.ss.domain_end[1]) - 1e-4)
+
+        xm_list = []
+        xp_list = []
+        g_list = []
+        for iy in range(ny):
+            yj = float(ys[iy])
+            if alternate_y:
+                sgn_y = 1.0 if (iy % 2) == 0 else -1.0
+            else:
+                sgn_y = 1.0
+            for iz in range(nz_sub):
+                # 与旧版一致：alternate 关则全部为 +gamma；开则仅按 y 索引交替（与 z 向分段数无关）
+                sgn = sgn_y if alternate_y else 1.0
+                z0s = float(zs[iz])
+                z1s = float(zs[iz + 1])
+                xm_list.append([x_emit, yj, z0s])
+                xp_list.append([x_emit, yj, z1s])
+                g_list.append(sgn * g0)
+
+        n_seg = len(xm_list)
+        if n_seg <= 0:
+            return
+        xm = np.asarray(xm_list, dtype=np.float32)
+        xp = np.asarray(xp_list, dtype=np.float32)
+        g = np.asarray(g_list, dtype=np.float32)
+
+        offset = int(self.ss.segment_num[None])
+        cap = int(self.ss.segment_max_num)
+        if offset >= cap:
+            return
+        n_new = min(n_seg, cap - offset)
+        if n_new <= 0:
+            return
+        self._seed_segments_kernel(offset, n_new, xm[:n_new], xp[:n_new], g[:n_new], st)
+        self.ss.segment_num[None] = offset + n_new
+
     def step(self):
         """
         独立 Segment 仿真的主步骤模板：
@@ -1285,13 +2016,16 @@ class SegmentSolver:
         6) 可选清理
         """
         if self.has_boundary:
-            self.boundary.update_boundary_pose()
-            self.boundary.generate_boundary_segments()
-            self.boundary.compute_k_matrix()
-            self.boundary.compute_rhs()
-            self.boundary.solve_linear_system()
-            self.boundary.commit_boundary_segments()
+            if self._boundary_schedule == "each_step":
+                strip = bool(self.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False))
+                self._run_boundary_injection_pipeline(strip_committed_first=strip)
+            elif not self._boundary_one_shot_done:
+                strip = bool(self.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False))
+                self._run_boundary_injection_pipeline(strip_committed_first=strip)
+                self._boundary_one_shot_done = True
 
+        self._emit_inlet_segments()
+        self.ss.update_segment_geometry()
         self.compute_endpoint_velocity()
         self.advect_segments_rk4()
         self.ss.update_segment_geometry()
@@ -1301,4 +2035,5 @@ class SegmentSolver:
         # 初始脉冲只生效一个时间步
         if self._use_leapfrog_initial_impulse[None] == 1:
             self._decay_impulse_kernel()
-        #self.cull_segments()
+        self._sim_step_index += 1
+        # self.cull_segments()

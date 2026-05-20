@@ -1,6 +1,7 @@
 import argparse
 import shutil
 import time
+import time as time_module
 from pathlib import Path
 
 import taichi as ti
@@ -42,8 +43,8 @@ def main():
     export_ply = bool(cfg.get_cfg("exportPLY", True))
     export_images = bool(cfg.get_cfg("exportImages", True))
 
-    out_ply = Path("result_segment_ply_TripleLine")
-    out_img = Path("result_segment_images_TripleLine")
+    out_ply = Path("result_segment_ply_Karman3D3")
+    out_img = Path("result_segment_images_Karman3D3")
     if export_ply:
         clear_dir(out_ply)
     if export_images:

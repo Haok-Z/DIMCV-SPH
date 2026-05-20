@@ -624,9 +624,9 @@ class DIMCVSPHSolver(SPHBase):
             lower_corner = squareCenter - 0.5 * squareSize
             cube_size = squareSize + self.ps.particle_radius * np.abs(
                 init_v) / np.linalg.norm(init_v)
-            self.ps.object_collection[obj_id][
-                "particleNum"] += self.ps.compute_cube_particle_num(
-                    lower_corner, lower_corner + cube_size)
+            # Match bookkeeping to actual inserts: add_cube may add fewer than
+            # compute_cube_particle_num when particle_num approaches particle_max_num.
+            pn_before = int(self.ps.particle_num[None])
             self.ps.add_cube(object_id=obj_id,
                              lower_corner=lower_corner,
                              cube_size=cube_size,
@@ -635,6 +635,8 @@ class DIMCVSPHSolver(SPHBase):
                              is_dynamic=1,
                              color=color,
                              material=1)
+            delta = int(self.ps.particle_num[None]) - pn_before
+            self.ps.object_collection[obj_id]["particleNum"] += delta
 
     def dump_num_particles_each_emitters_ti2np(self):
         for obj_id in self.ps.obj_id_emitters:

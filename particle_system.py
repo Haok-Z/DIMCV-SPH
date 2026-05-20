@@ -4,6 +4,8 @@ import trimesh as tm
 from functools import reduce
 from config_builder import SimConfig
 from karman_vortex import KarmanVortexSolver
+from dfsph_karman_solver import DFSPHKarmanVortexSolver
+from dfsph_segment_hybrid_solver import DFSPHSegmentHybridKarmanSolver
 
 
 @ti.data_oriented
@@ -30,6 +32,24 @@ class ParticleSystem:
         self.domain_end_ti = ti.Vector.field(self.dim, dtype=float, shape=())
         self.domain_start_ti.from_numpy(self.domain_start)
         self.domain_end_ti.from_numpy(self.domain_end)
+
+        margin_cull = float(self.cfg.get_cfg("domainCullMargin", 0.0) or 0.0)
+        c_lo = self.domain_start.astype(np.float64) + margin_cull
+        c_hi = self.domain_end.astype(np.float64) - margin_cull
+        for d in range(self.dim):
+            if c_lo[d] >= c_hi[d]:
+                c_hi[d] = c_lo[d] + 1e-6
+        self.domain_cull_lo_ti = ti.Vector.field(self.dim, dtype=float, shape=())
+        self.domain_cull_hi_ti = ti.Vector.field(self.dim, dtype=float, shape=())
+        self.domain_cull_lo_ti.from_numpy(c_lo.astype(np.float32))
+        self.domain_cull_hi_ti.from_numpy(c_hi.astype(np.float32))
+
+        _dfd = self.cfg.get_cfg("deleteFluidParticlesOutsideDomain", None)
+        if _dfd is None:
+            _dfd = True
+        self._cull_fluid_domain = ti.field(dtype=ti.i32, shape=())
+        self._cull_fluid_domain[None] = 1 if bool(_dfd) else 0
+
         # Simulation method
         self.simulation_method = self.cfg.get_cfg("simulationMethod")
 
@@ -307,11 +327,17 @@ class ParticleSystem:
         )
 
     def build_solver(self):
+        # 0: DIMCV + DFSPH, 1: DFSPH-only, 2: DFSPH + vortex segments (coupled BS feedback)
         if self.simulation_method == 0:
             return KarmanVortexSolver(self)
-        else:
-            raise NotImplementedError(
-                f"Solver type {self.solver_type} has not been implemented.")
+        if self.simulation_method == 1:
+            return DFSPHKarmanVortexSolver(self)
+        if self.simulation_method == 2:
+            return DFSPHSegmentHybridKarmanSolver(self)
+        raise NotImplementedError(
+            f"simulationMethod {self.simulation_method} is not implemented "
+            "(use 0 DIMCV+DFSPH, 1 DFSPH-only, 2 DFSPH+segments)."
+        )
 
     @ti.func
     def add_particle(self, p, obj_id, x, v, density, pressure, material,
@@ -416,15 +442,22 @@ class ParticleSystem:
             if self.material[i] == self.material_solid:
                 self.is_active[i] = 1
             elif self.material[i] == self.material_fluid:
+                if self._cull_fluid_domain[None] != 1:
+                    continue
+                if self.is_active[i] != 1:
+                    continue
+                out = 0
                 for j in range(self.dim):
-                    if self.x[i][j] < self.domain_start_ti[None][j] or self.x[
-                            i][j] > self.domain_end_ti[None][j]:
-                        self.is_active[i] = 0
-                        self.fluid_particle_num[None] -= 1
-                        obj_id = self.object_id[i]
-                        if ti.static(self.num_emitters > 0):
+                    if self.x[i][j] < self.domain_cull_lo_ti[None][j] or self.x[
+                            i][j] > self.domain_cull_hi_ti[None][j]:
+                        out = 1
+                if out == 1:
+                    self.is_active[i] = 0
+                    self.fluid_particle_num[None] -= 1
+                    obj_id = self.object_id[i]
+                    if ti.static(self.num_emitters > 0):
+                        if obj_id >= 0 and obj_id < self.num_emitters:
                             self.num_particles_each_emitter[obj_id] -= 1
-                        break
 
     @ti.kernel
     def particle_partition(self):
@@ -552,12 +585,16 @@ class ParticleSystem:
             self.is_sample[I] = self.is_sample_buffer[I]
             self.life_time[I] = self.life_time_buffer[I]
 
-    def initialize_particle_system(self):
-        self.update_activity()
-        self.particle_partition()
+    def rebuild_neighbor_grid(self):
+        """Recompute grid hash / counting sort after particle_num changes (e.g. emit)."""
         self.update_grid_id()
         self.prefix_sum_executor.run(self.grid_particles_num)
         self.counting_sort()
+
+    def initialize_particle_system(self):
+        self.update_activity()
+        self.particle_partition()
+        self.rebuild_neighbor_grid()
 
     @ti.func
     def for_all_neighbors(self, p_i, task: ti.template(), ret: ti.template()):

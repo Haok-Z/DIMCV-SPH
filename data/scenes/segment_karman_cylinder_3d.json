@@ -1,0 +1,163 @@
+{
+  "Configuration": {
+    "domainStart": [0.0, 0.0, 0.0],
+    "domainEnd": [4.0, 1.0, 1.0],
+    "particleRadius": 0.0045,
+    "numberOfStepsPerRenderUpdate": 1,
+    "density0": 1000,
+    "simulationMethod": 0,
+    "gravitation": [0.0, 0.0, 0.0],
+    "timeStepSize": 0.002,
+    "stiffness": 50000,
+    "exponent": 7,
+    "boundaryHandlingMethod": 0,
+    "bounceBackBoundary": false,
+    "simulationTime": 12,
+    "vortexEnforcingDomainStart": [0.2, 0.0, 0.0],
+    "vortexEnforcingDomainEnd": [4.0, 1.0, 1.0],
+    "volumeScale": 0.2,
+    "GenProbPara": 5,
+    "DelProbPara": 3.5,
+    "reservedCapacity": 1000000,
+    "windowRes": [2048, 512, 512],
+    "divergenceTransitArea": [0.0, 0.02, 0.02],
+    "invisibleObjects": [1, 2, 2],
+    "exportPLY": true
+  },
+  "SegmentConfiguration": {
+    "domainStart": [0.0, 0.0, 0.0],
+    "domainEnd": [4.0, 1.0, 1.0],
+    "timeStepSize": 0.002,
+    "simulationTime": 20.0,
+    "segmentMaxNum": 220000,
+
+    "biotSavartModel": "finite_segment",
+    "regularizationRadiusR": 0.006,
+    "backgroundVelocity": [1.0, 0.0, 0.0],
+
+    "segmentGravitationScale": 0.0025,
+
+    "splitLengthThreshold": 0.15,
+    "mergeDistanceLambda": 0.04,
+    "mergeAngleThreshold": 4.6,
+    "deleteGammaThreshold": 1e-6,
+    "deleteOutsideDomain": true,
+    "gammaDecay": 1.0,
+    "enableSplitSegments": true,
+    "enableMergeSegments": true,
+    "mergeRequireSameSegmentType": true,
+    "splitSkipSegmentTypeIds": [2],
+
+    "enableBoundaryInjection": false,
+    "boundaryInjectionSchedule": "initialize_only",
+    "boundaryReplaceCommittedEachStep": false,
+    "boundarySegmentTypeId": 2,
+    "boundaryLeastSquaresEps": 2e-3,
+    "boundaryCommitGammaThreshold": 1e-8,
+    "boundarySegmentLength": 0.03,
+    "boundarySegmentInset": 0.005,
+    "numBoundarySamples": 3000,
+    "boundaryCylinderSampleWeight": 8,
+    "boundaryAabbSampleWeight": 3,
+    "numGeneratedBoundarySegments": 0,
+    "boundaryMinSamplesPerObstacle": 80,
+    "boundarySampleSeed": 11,
+    "rhsIncludeInternalSegments": true,
+    "advectFreezeBoundarySegments": true,
+
+    "initType": "none",
+
+    "emitterEnabled": true,
+    "emitterUseFluidEmitterLayout": false,
+    "emitterSeed": 123,
+    "emitterIntervalSteps": 1,
+    "emitterNy": 22,
+    "emitterX": 0.06,
+    "emitterY0": 0.12,
+    "emitterY1": 0.88,
+    "emitterZ0": 0.1,
+    "emitterZ1": 0.9,
+    "emitterSubdivisionsZ": 1,
+    "emitterGamma": 0.012,
+    "emitterGammaAlternateY": true,
+    "emitterYJitter": 0.008,
+    "emitterSegTypeId": 0,
+
+    "outflowDeleteCenterBeyondX": 3.96,
+
+    "exportInterval": 6,
+    "exportPLY": true,
+    "exportPLYAxisConvention": "z_up",
+    "exportPLYIncludeSolids": true,
+    "imageShowSolids": true,
+    "exportImages": true,
+    "debugPrintEndpointVelocity": false,
+
+    "imageFollowSegments": true,
+    "imageFollowMinSpan": [2.8, 0.95, 0.95],
+    "imageViewMarginRatio": 0.08,
+    "imageGammaVmin": -0.04,
+    "imageGammaVmax": 0.04,
+    "imageLineWidth": 0.65,
+    "imagePointSize": 2.0
+  },
+  "FluidEmitters": [
+    {
+      "objectId": 0,
+      "squareCenter": [0.0, 0.5, 0.2],
+      "squareSize": [0.0, 0.90, 0.3],
+      "velocity": [1.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [50, 100, 200]
+    }
+  ],
+  "RigidBlocks": [
+    {
+      "objectId": 1,
+      "start": [0.0, 0.0, 0.0],
+      "end": [4.0, 1.00, 0.02],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [0.0, 0.0, 0.0],
+      "end": [4.0, 0.02, 1.00],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [0.0, 0.98, 0.0],
+      "end": [4.0, 1.0, 1.0],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    }
+  ],
+  "RigidCylinders": [
+    {
+      "objectId": 2,
+      "center": [0.85, 0.5, 0.45],
+      "translation": [0.0, 0.0, 0.0],
+      "axis": "z",
+      "radius": 0.09,
+      "halfHeight": 0.45,
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [220, 120, 80],
+      "isDynamic": false
+    }
+  ]
+}

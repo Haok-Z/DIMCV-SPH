@@ -2,8 +2,9 @@ import json
 
 class SimConfig:
     def __init__(self, scene_file_path) -> None:
+        self.scene_file_path = scene_file_path
         self.config = None
-        with open(scene_file_path, "r") as f:
+        with open(scene_file_path, "r", encoding="utf-8") as f:
             self.config = json.load(f)
         print(self.config)
     

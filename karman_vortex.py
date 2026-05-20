@@ -4,16 +4,30 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 
+from segment_export import SegmentExporter
+
 
 class KarmanVortexSolver(DIMCVSPHSolver):
 
     def __init__(self, particle_system):
         super().__init__(particle_system)
-        self.circle_pos = ti.Vector([0.65, 0.5, 0.5])
+        cc = self.ps.cfg.get_cfg("cylinderCenter", None)
+        if cc is not None:
+            self.circle_pos = np.array(cc, dtype=np.float64)
+        elif self.ps.dim == 2:
+            self.circle_pos = np.array([0.65, 0.5], dtype=np.float64)
+        else:
+            self.circle_pos = np.array([0.65, 0.5, 0.5], dtype=np.float64)
+        _cr = self.ps.cfg.get_cfg("cylinderRadius")
+        self.circle_radius = float(_cr if _cr is not None else 0.1)
         self.circle_vis = ti.Vector.field(self.ps.dim, dtype=float, shape=1)
-        self.circle_vis[0] = ti.Vector(
-            [self.circle_pos[0] * 0.25, self.circle_pos[1], self.circle_pos[2]])
-        self.circle_radius = 0.1
+        if self.ps.dim == 2:
+            self.circle_vis[0] = ti.Vector(
+                [self.circle_pos[0] * 0.25, self.circle_pos[1]])
+        else:
+            self.circle_vis[0] = ti.Vector([
+                self.circle_pos[0] * 0.25, self.circle_pos[1], self.circle_pos[2]
+            ])
         self.init_cylinder()
 
     @ti.kernel
@@ -21,7 +35,8 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         for p in range(self.ps.particle_num[None]):
             if self.ps.object_id[p] == 2:
                 if (self.ps.x[p] - self.circle_pos).norm() > self.circle_radius:
-                    self.ps.x[p] = ti.Vector([0, 0, 0])
+                    for d in ti.static(range(self.ps.dim)):
+                        self.ps.x[p][d] = 0.0
                     self.ps.is_active[p] = 0
 
     @ti.kernel
@@ -32,7 +47,8 @@ class KarmanVortexSolver(DIMCVSPHSolver):
                 dy = self.ps.x[p][1] - self.circle_pos[1]
                 # Cylinder axis along z, so radius in x-y plane
                 if ti.sqrt(dx * dx + dy * dy) > self.circle_radius:
-                    self.ps.x[p] = ti.Vector([0, 0, 0])
+                    for d in ti.static(range(self.ps.dim)):
+                        self.ps.x[p][d] = 0.0
                     self.ps.is_active[p] = 0
 
     def export_png(self, cnt, image_path):
@@ -40,15 +56,63 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         material = self.ps.material.to_numpy()[:N]
         obj_id = self.ps.object_id.to_numpy()[:N]
         fluid_mask = (material == self.ps.material_fluid)
-        #solid_mask = (material == self.ps.material_solid)
-        solid_mask = (obj_id == 2)
+        # 刚体块 objectId=1（通道壁）与圆柱 objectId=2 均以绿色叠加显示
+        solid_mask = (obj_id == 1) | (obj_id == 2)
 
         x = self.x_temp.to_numpy()[:N]
-        vort = self.ps.vorticity_vis.to_numpy()[:N][:, 2]
+        vort_np = self.ps.vorticity_vis.to_numpy()[:N]
+        vort = vort_np[:, 2] if vort_np.shape[1] > 2 else vort_np[:, 0]
 
         fluid_x = x[fluid_mask]
         fluid_vort = vort[fluid_mask]
         solid_x = x[solid_mask]
+
+        ds = self.ps.domain_start
+        de = self.ps.domain_end
+        _vmin = self.ps.cfg.get_cfg("imageVorticityVmin")
+        _vmax = self.ps.cfg.get_cfg("imageVorticityVmax")
+        _auto_scale = self.ps.cfg.get_cfg("imageVorticityAutoScale")
+        if _auto_scale and fluid_vort.size > 0:
+            vmin = float(np.percentile(fluid_vort, 2))
+            vmax = float(np.percentile(fluid_vort, 98))
+            if vmax <= vmin + 1e-12:
+                vmax = vmin + 1.0
+        else:
+            vmin = float(_vmin if _vmin is not None else -40)
+            vmax = float(_vmax if _vmax is not None else 40)
+        vnorm = Normalize(vmin=vmin, vmax=vmax)
+
+        _pt = self.ps.cfg.get_cfg("imageFluidPointSize")
+        _al = self.ps.cfg.get_cfg("imageFluidAlpha")
+        if self.ps.dim == 2:
+            pt_size = float(_pt if _pt is not None else 2.5)
+            pt_alpha = float(_al if _al is not None else 1.0)
+        else:
+            pt_size = float(_pt if _pt is not None else 0.2)
+            pt_alpha = float(_al if _al is not None else 0.6)
+
+        if self.ps.dim == 2:
+            fig, ax = plt.subplots(figsize=(10, 2.5), dpi=200)
+            ax.scatter(
+                fluid_x[:, 0], fluid_x[:, 1], c=fluid_vort, cmap="coolwarm",
+                s=pt_size, norm=vnorm, edgecolors="none", alpha=pt_alpha,
+            )
+            if solid_x.shape[0] > 0:
+                ax.scatter(
+                    solid_x[:, 0], solid_x[:, 1], color="#00C853",
+                    s=1.0, edgecolors="none",
+                )
+            ax.set_xlim(float(ds[0]), float(de[0]))
+            ax.set_ylim(float(ds[1]), float(de[1]))
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_axis_off()
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            plt.savefig(
+                image_path / f"vorticity_{cnt:04}.png",
+                bbox_inches="tight", pad_inches=0, transparent=True, dpi=400,
+            )
+            plt.close("all")
+            return
 
         fig = plt.figure(figsize=(10, 4), dpi=200)
         ax = fig.add_subplot(111, projection='3d')
@@ -58,10 +122,10 @@ class KarmanVortexSolver(DIMCVSPHSolver):
                         fluid_x[:, 2],
                         c=fluid_vort,
                         cmap='coolwarm',
-                        s=0.2,  # 3D 模式下粒子尺寸建议调小
-                        norm=Normalize(vmin=-40, vmax=40),
+                        s=pt_size,
+                        norm=vnorm,
                         edgecolors='none',
-                        alpha=0.6)
+                        alpha=pt_alpha)
         ax.scatter(solid_x[:, 0],
                    solid_x[:, 1],
                    solid_x[:, 2],
@@ -132,6 +196,10 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             2 = rigid block
             3 = rigid body
             4 = other / unknown
+
+        ``Configuration.exportPLYAxisConvention`` matches ``segment_export``:
+        ``y_up`` / ``same`` / ``sim`` (no change), or ``z_up`` / ``houdini``
+        maps (x,y,z) and vorticity as (x,z,y).
         """
         N = self.ps.particle_num[None]
         if N == 0:
@@ -178,6 +246,10 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         particle_type[rigid_block_mask] = 2
         particle_type[rigid_body_mask] = 3
 
+        ply_axis_conv = str(
+            self.ps.cfg.get_cfg("exportPLYAxisConvention", "y_up") or "y_up"
+        )
+
         # Ensure output directory exists
         ply_path.mkdir(parents=True, exist_ok=True)
         file_path = ply_path / f"frame_{cnt:04}.ply"
@@ -200,10 +272,14 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             f.write("property uchar particle_type\n")
             f.write("end_header\n")
 
-            # Data rows
+            # Data rows (axis convention for DCC: same rules as segment PLY)
             for i in range(num_vertices):
-                px, py, pz = x[i]
-                vx, vy, vz = vorticity[i]
+                p = SegmentExporter._apply_ply_axis_convention(x[i], ply_axis_conv)
+                w = SegmentExporter._apply_ply_axis_convention(
+                    np.asarray(vorticity[i], dtype=np.float64), ply_axis_conv
+                )
+                px, py, pz = float(p[0]), float(p[1]), float(p[2])
+                vx, vy, vz = float(w[0]), float(w[1]), float(w[2])
                 r, g, b = color[i]
                 oid = int(obj_id[i])
                 ptype = int(particle_type[i])
@@ -214,12 +290,14 @@ class KarmanVortexSolver(DIMCVSPHSolver):
                 )
 
     def step(self):
-        self.dump_num_particles_each_emitters_ti2np()
+        # Cull out-of-domain fluid and compact first so emit sees freed slots.
+        self.ps.initialize_particle_system()
         if self.cnt % self.emit_interval == 0:
+            self.dump_num_particles_each_emitters_ti2np()
             self.emit_particle()
             self.dump_num_particles_each_emitters_np2ti()
+            self.ps.rebuild_neighbor_grid()
         self.cnt += 1
-        self.ps.initialize_particle_system()
         self.compute_moving_boundary_volume()
         self.substep()
 

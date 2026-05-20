@@ -38,7 +38,8 @@
     "imageShowColorbar": false,
 
     "exportImages": true,
-    "exportPLY": true
+    "exportPLY": true,
+    "biotSavartModel": "finite_segment"
   }
 }
 

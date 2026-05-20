@@ -1,12 +1,14 @@
 {
-	"Configuration": 
+	"Configuration":
 	{
         "domainStart": [0.0, 0.0, 0.0],
         "domainEnd": [4.0, 1.0, 1.0],
+        "deleteFluidParticlesOutsideDomain": true,
+        "domainCullMargin": 0.0,
 		"particleRadius": 0.0045,
 		"numberOfStepsPerRenderUpdate": 1,
-		"density0": 1000, 
-		"simulationMethod": 0,
+		"density0": 1000,
+		"simulationMethod": 1,
         "gravitation": [0.0, 0.0, -9.8],
 		"timeStepSize": 0.002,
 		"stiffness": 50000,
@@ -23,51 +25,16 @@
         "windowRes": [2048,512,512],
 		"divergenceTransitArea": [0.0,0.02,0.02],
 		"invisibleObjects":[1,2,2],
-        "exportPLY": true
-	},
-
-    "SegmentConfiguration":
-    {
-        "domainStart": [0.0, 0.0, 0.0],
-        "domainEnd": [4.0, 1.0, 1.0],
-        "timeStepSize": 0.003,
-        "simulationTime": 30.0,
-        "segmentMaxNum": 200000,
-        "regularizationRadiusR": 0.002,
-        "backgroundVelocity": [0.0, 0.0, 0.0],
-        "splitLengthThreshold": 0.08,
-        "mergeDistanceLambda": 0.05,
-        "mergeAngleThreshold": 4.617993878,
-        "deleteGammaThreshold": 0.0001,
-        "gammaDecay": 0.999,
-        "enableBoundaryInjection": false,
-        "numBoundarySamples": 128,
-        "numGeneratedBoundarySegments": 256,
-        "exportInterval": 8,
         "exportPLY": true,
-		"initType": "ring",
-		"initCenter": [0.2, 0.5, 0.5],
-		"initSegmentNum": 512,
-		"initRingRadius": 0.23,
-		"initGamma": 40,
-		"imageFollowSegments": true,
-		"imageFollowExtraScale": 1,
-		"imageFollowMinSpan": [2.5, 0.9, 0.9],
-		"imageViewMarginRatio": 0.1,
-		"imageShowColorbar": false,
-		"biotSavartModel": "finite_segment",
-		"initPerturbSeed": 42,
-		"initCenterJitter": 0.02,
-		"initRingRadialJitter": 0.004,
-		"initRingPhaseJitter": 0.04
-    },
+        "exportPLYAxisConvention": "y_up"
+	},
 
 	"FluidEmitters":[
 		{
 			"objectId": 0,
 			"squareCenter":[0.0,0.5,0.2],
 			"squareSize": [0.0, 0.94, 0.3],
-			"velocity": [2.5, 0.0, 0.0],
+			"velocity": [2.0, 0.0, 0.0],
 			"density": 1000.0,
 			"color": [50, 100, 200]
 		}
@@ -131,7 +98,7 @@
 		},
 		{
 			"objectId": 2,
-			"start": [0.1, 0.1, 0.1],
+			"start": [0.1, 0.1, 0.0],
 			"end": [1.5, 0.9, 0.9],
 			"translation": [0.0, 0.0, 0.0],
 			"scale": [1, 1, 1],

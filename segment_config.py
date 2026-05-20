@@ -10,6 +10,10 @@ class SegmentConfig:
         seg_cfg = self.config.get("SegmentConfiguration", {})
         return seg_cfg.get(name, default)
 
+    def get_configuration_dict(self):
+        """与 SPH 共用的顶层 Configuration（如 gravitation）。"""
+        return self.config.get("Configuration", {}) or {}
+
     def get_domain_start(self):
         return self.get_cfg("domainStart", [0.0, 0.0, 0.0])
 
@@ -18,6 +22,10 @@ class SegmentConfig:
 
     def get_obstacles(self):
         return self.config.get("RigidBlocks", [])
+
+    def get_cylinders(self):
+        """与 RigidBlocks 并列：圆柱障碍（供 Segment 边界采样 / 虚拟段）。"""
+        return self.config.get("RigidCylinders", [])
 
     def get_inflow(self):
         return self.config.get("FluidEmitters", [])

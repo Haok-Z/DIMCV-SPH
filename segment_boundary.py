@@ -26,10 +26,11 @@ class SegmentBoundaryHandler:
         self._boundary_initialized = False
         self._b_points = None  # (Nb, 3) float32，边界采样点 b_i
         self._b_vel = None  # (Nb, 3) float32，采样点处规定的边界速度 u_b(b_i)
-        self._b_owner = None  # (Nb,) int32，所属 rigid block 的索引（便于调试）
+        self._b_owner = None  # (Nb,) int32，障碍全局索引：0..N_aabb-1 为 RigidBlocks，其后为圆柱
 
         # 缓存 rigid blocks 以及（可选）动态平移信息
         self._rigid_blocks = self.ss.cfg.get_obstacles() if hasattr(self.ss.cfg, "get_obstacles") else []
+        self._num_aabb_obstacles = int(len(self._rigid_blocks))
         self._block_dynamic = []
         self._block_vel = []
         self._block_translation = []
@@ -40,6 +41,18 @@ class SegmentBoundaryHandler:
             self._block_dynamic.append(is_dyn)
             self._block_vel.append(vel)
             self._block_translation.append(tr)
+
+        self._cylinders = self.ss.cfg.get_cylinders() if hasattr(self.ss.cfg, "get_cylinders") else []
+        self._cylinder_dynamic = []
+        self._cylinder_vel = []
+        self._cylinder_translation = []
+        for cyl in self._cylinders:
+            is_dyn = bool(cyl.get("isDynamic", False))
+            vel = np.array(cyl.get("velocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+            tr = np.array(cyl.get("translation", [0.0, 0.0, 0.0]), dtype=np.float32)
+            self._cylinder_dynamic.append(is_dyn)
+            self._cylinder_vel.append(vel)
+            self._cylinder_translation.append(tr)
 
         # 边界虚拟段（候选段）状态：本模块先在 CPU 侧生成，后续 commit 时写入段池
         self.ng = int(self.ss.cfg.get_cfg("numGeneratedBoundarySegments", 0) or 0)
@@ -66,6 +79,54 @@ class SegmentBoundaryHandler:
         self._U_nb = 0
         self._u_d = None  # (Nb,3) float32，用于调试：内部段诱导速度
 
+    @staticmethod
+    def _rebalance_boundary_sample_counts(
+        counts: list,
+        nb: int,
+        min_per_obstacle: int,
+    ) -> list:
+        """
+        在按表面积比例分配后，抬高小面积障碍（如圆柱）的采样下限，并从大障碍收回采样，
+        使总数仍为 nb。若 min_per_obstacle * n > nb，则允许个别障碍最终低于 min（从大障碍扣）。
+        """
+        counts = [int(max(0, c)) for c in counts]
+        n_obs = len(counts)
+        if n_obs == 0 or nb <= 0:
+            return counts
+        mp = int(max(0, min_per_obstacle))
+        if mp <= 0:
+            s = sum(counts)
+            if s == nb:
+                return counts
+            if s < nb:
+                k = 0
+                while sum(counts) < nb:
+                    counts[k % n_obs] += 1
+                    k += 1
+            else:
+                while sum(counts) > nb:
+                    j = int(np.argmax(counts))
+                    if counts[j] <= 0:
+                        break
+                    counts[j] -= 1
+            return counts
+
+        for i in range(n_obs):
+            if counts[i] < mp:
+                counts[i] = mp
+        s = sum(counts)
+        while s > nb:
+            j = int(np.argmax(counts))
+            if counts[j] <= 1:
+                break
+            counts[j] -= 1
+            s -= 1
+        k = 0
+        while sum(counts) < nb:
+            counts[k % n_obs] += 1
+            k += 1
+        return counts
+
     @ti.kernel
     def _commit_segments_kernel(
         self,
@@ -78,8 +139,7 @@ class SegmentBoundaryHandler:
     ):
         for k in range(n_new):
             i = offset + k
-            self.ss.x_minus[i] = ti.Vector([x_minus[k, 0], x_minus[k, 1], x_minus[k, 2]])
-            self.ss.x_plus[i] = ti.Vector([x_plus[k, 0], x_plus[k, 1], x_plus[k, 2]])
+            self.ss.set_segment_ends_from_ndarray_row(i, k, x_minus, x_plus)
             self.ss.gamma[i] = gamma[k]
             self.ss.active[i] = 1
             self.ss.age[i] = 0.0
@@ -207,6 +267,62 @@ class SegmentBoundaryHandler:
         return lo2, hi2
 
     @staticmethod
+    def _cylinder_world_geometry(cyl, translation_override=None):
+        tr = np.array(cyl.get("translation", [0.0, 0.0, 0.0]), dtype=np.float32)
+        if translation_override is not None:
+            tr = np.array(translation_override, dtype=np.float32)
+        center = np.array(cyl.get("center", [0.0, 0.0, 0.0]), dtype=np.float32) + tr
+        r = float(cyl.get("radius", 0.1))
+        hh = float(cyl.get("halfHeight", 0.5))
+        axis = str(cyl.get("axis", "z")).lower().strip()
+        return center, axis, r, hh
+
+    @staticmethod
+    def _cylinder_lateral_area(cyl, translation_override=None):
+        _, _, r, hh = SegmentBoundaryHandler._cylinder_world_geometry(cyl, translation_override)
+        h = 2.0 * max(hh, 1e-8)
+        return float(2.0 * np.pi * max(r, 1e-8) * h)
+
+    @staticmethod
+    def _sample_points_on_cylinder_lateral(cyl, n, rng: np.random.Generator, translation_override=None):
+        center, axis, r, hh = SegmentBoundaryHandler._cylinder_world_geometry(cyl, translation_override)
+        u = rng.random((n, 2))
+        theta = (2.0 * np.pi * u[:, 0]).astype(np.float32)
+        s = ((2.0 * u[:, 1] - 1.0) * hh).astype(np.float32)
+        rf = np.float32(r)
+        pts = np.zeros((n, 3), dtype=np.float32)
+        c0, c1, c2 = float(center[0]), float(center[1]), float(center[2])
+        if axis == "z":
+            pts[:, 0] = np.float32(c0) + np.cos(theta) * rf
+            pts[:, 1] = np.float32(c1) + np.sin(theta) * rf
+            pts[:, 2] = np.float32(c2) + s
+        elif axis == "y":
+            pts[:, 0] = np.float32(c0) + np.cos(theta) * rf
+            pts[:, 1] = np.float32(c1) + s
+            pts[:, 2] = np.float32(c2) + np.sin(theta) * rf
+        else:
+            pts[:, 0] = np.float32(c0) + s
+            pts[:, 1] = np.float32(c1) + np.cos(theta) * rf
+            pts[:, 2] = np.float32(c2) + np.sin(theta) * rf
+        return pts
+
+    def _estimate_cylinder_normal(self, p: np.ndarray, cyl, translation_override=None):
+        center, axis, _, _ = self._cylinder_world_geometry(cyl, translation_override)
+        d = p.astype(np.float64) - center.astype(np.float64)
+        ax = str(axis).lower()
+        n = np.zeros(3, dtype=np.float64)
+        if ax == "z":
+            n[0], n[1] = d[0], d[1]
+        elif ax == "y":
+            n[0], n[2] = d[0], d[2]
+        else:
+            n[1], n[2] = d[1], d[2]
+        nn = float(np.linalg.norm(n))
+        if nn < 1e-10:
+            return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        return (n / nn).astype(np.float32)
+
+    @staticmethod
     def _sample_points_on_aabb_surface(lo, hi, n, rng: np.random.Generator):
         """
         在轴对齐盒子的表面均匀采样 n 个点。
@@ -281,39 +397,56 @@ class SegmentBoundaryHandler:
             seed = self.ss.cfg.get_cfg("boundarySampleSeed", 0)
             rng = np.random.default_rng(int(seed))
 
-            if len(self._rigid_blocks) == 0:
-                # 没有边界块：无需采样
+            if len(self._rigid_blocks) == 0 and len(self._cylinders) == 0:
                 self._b_points = np.zeros((0, 3), dtype=np.float32)
                 self._b_vel = np.zeros((0, 3), dtype=np.float32)
                 self._b_owner = np.zeros((0,), dtype=np.int32)
                 self._boundary_initialized = True
                 return
 
-            # 按每个 block 的表面积比例分配采样数
-            block_areas = []
+            # 按每个 AABB 与圆柱侧面积的表面积比例分配采样数（圆柱仅采侧表面）
+            obstacle_areas = []
             for bi, blk in enumerate(self._rigid_blocks):
                 lo, hi = self._apply_block_transform(blk, translation_override=self._block_translation[bi])
                 extent = np.maximum(hi - lo, 0.0)
                 ex, ey, ez = float(extent[0]), float(extent[1]), float(extent[2])
                 area = 2.0 * (ex * ey + ex * ez + ey * ez)
-                block_areas.append(max(area, 0.0))
-            area_sum = float(np.sum(block_areas))
+                obstacle_areas.append(max(area, 0.0))
+            for ci, cyl in enumerate(self._cylinders):
+                area = self._cylinder_lateral_area(cyl, translation_override=self._cylinder_translation[ci])
+                obstacle_areas.append(max(area, 0.0))
 
-            if area_sum <= 0.0:
-                # 兜底：等分分配
-                per = max(1, self.nb // max(1, len(self._rigid_blocks)))
-                counts = [per for _ in self._rigid_blocks]
+            # 有效面积权重：在总采样数 nb 固定时，提高圆柱权重可让圆柱上采样更密、平板相对更稀。
+            aabb_w = float(self.ss.cfg.get_cfg("boundaryAabbSampleWeight", 1.0) or 1.0)
+            cyl_w = float(self.ss.cfg.get_cfg("boundaryCylinderSampleWeight", 1.0) or 1.0)
+            aabb_w = max(0.0, aabb_w)
+            cyl_w = max(0.0, cyl_w)
+            for idx in range(0, min(self._num_aabb_obstacles, len(obstacle_areas))):
+                obstacle_areas[idx] *= aabb_w
+            for idx in range(self._num_aabb_obstacles, len(obstacle_areas)):
+                obstacle_areas[idx] *= cyl_w
+
+            n_obs = len(obstacle_areas)
+            area_sum = float(np.sum(obstacle_areas))
+
+            if area_sum <= 0.0 or n_obs == 0:
+                per = max(1, self.nb // max(1, n_obs))
+                counts = [per for _ in range(n_obs)]
                 counts[0] += self.nb - sum(counts)
+                min_bo = int(self.ss.cfg.get_cfg("boundaryMinSamplesPerObstacle", 0) or 0)
+                counts = self._rebalance_boundary_sample_counts(counts, self.nb, min_bo)
             else:
-                raw = np.array(block_areas, dtype=np.float64) / area_sum * float(self.nb)
+                raw = np.array(obstacle_areas, dtype=np.float64) / area_sum * float(self.nb)
                 counts = np.floor(raw).astype(int).tolist()
-                # 将剩余采样数按最大“小数部分”分配
                 remaining = self.nb - int(np.sum(counts))
                 if remaining > 0:
                     frac = raw - np.floor(raw)
                     order = np.argsort(-frac)
                     for k in range(remaining):
                         counts[int(order[k % len(counts)])] += 1
+
+            min_bo = int(self.ss.cfg.get_cfg("boundaryMinSamplesPerObstacle", 0) or 0)
+            counts = self._rebalance_boundary_sample_counts(counts, self.nb, min_bo)
 
             pts_all = []
             vel_all = []
@@ -325,13 +458,22 @@ class SegmentBoundaryHandler:
                 lo, hi = self._apply_block_transform(blk, translation_override=self._block_translation[bi])
                 pts = self._sample_points_on_aabb_surface(lo, hi, n_i, rng)
                 pts_all.append(pts)
-
-                # 这些采样点处的边界速度 u_b：
-                # - 静态 block：为 0
-                # - 动态 block：取其平移速度（暂不处理旋转）
                 v = self._block_vel[bi] if self._block_dynamic[bi] else np.zeros(3, dtype=np.float32)
                 vel_all.append(np.repeat(v[None, :], n_i, axis=0))
                 owner_all.append(np.full((n_i,), bi, dtype=np.int32))
+
+            for ci, cyl in enumerate(self._cylinders):
+                n_i = int(counts[self._num_aabb_obstacles + ci])
+                if n_i <= 0:
+                    continue
+                obs_id = self._num_aabb_obstacles + ci
+                pts = self._sample_points_on_cylinder_lateral(
+                    cyl, n_i, rng, translation_override=self._cylinder_translation[ci]
+                )
+                pts_all.append(pts)
+                v = self._cylinder_vel[ci] if self._cylinder_dynamic[ci] else np.zeros(3, dtype=np.float32)
+                vel_all.append(np.repeat(v[None, :], n_i, axis=0))
+                owner_all.append(np.full((n_i,), obs_id, dtype=np.int32))
 
             if len(pts_all) == 0:
                 self._b_points = np.zeros((0, 3), dtype=np.float32)
@@ -347,22 +489,32 @@ class SegmentBoundaryHandler:
 
         # 若存在动态边界（目前仅支持平移），则更新缓存采样点
         dt = self._get_dt()
-        any_dynamic = any(self._block_dynamic)
+        any_dynamic = any(self._block_dynamic) or any(self._cylinder_dynamic)
         if not any_dynamic:
             return
 
-        # 更新每个 block 的平移量，并同步移动其所属的边界采样点
         for bi, is_dyn in enumerate(self._block_dynamic):
             if is_dyn:
                 self._block_translation[bi] = self._block_translation[bi] + self._block_vel[bi] * dt
 
-        # 按所属 block 的平移速度移动边界采样点
+        for ci, is_dyn in enumerate(self._cylinder_dynamic):
+            if is_dyn:
+                self._cylinder_translation[ci] = self._cylinder_translation[ci] + self._cylinder_vel[ci] * dt
+
         for bi, is_dyn in enumerate(self._block_dynamic):
             if not is_dyn:
                 continue
-            mask = (self._b_owner == bi)
+            mask = self._b_owner == bi
             if np.any(mask):
                 self._b_points[mask] += self._block_vel[bi][None, :] * dt
+
+        for ci, is_dyn in enumerate(self._cylinder_dynamic):
+            if not is_dyn:
+                continue
+            oid = self._num_aabb_obstacles + ci
+            mask = self._b_owner == oid
+            if np.any(mask):
+                self._b_points[mask] += self._cylinder_vel[ci][None, :] * dt
 
     def generate_boundary_segments(self):
         """
@@ -405,12 +557,16 @@ class SegmentBoundaryHandler:
         for k in range(ng):
             bi = int(chosen[k])
             p = self._b_points[bi]
-            owner_blk = int(self._b_owner[bi])
+            owner = int(self._b_owner[bi])
 
-            # 估计边界外法向 n（仅对 AABB RigidBlocks）
-            blk = self._rigid_blocks[owner_blk]
-            lo, hi = self._apply_block_transform(blk, translation_override=self._block_translation[owner_blk])
-            n = self._estimate_aabb_normal(p, lo, hi)  # 外法向
+            if owner < self._num_aabb_obstacles:
+                blk = self._rigid_blocks[owner]
+                lo, hi = self._apply_block_transform(blk, translation_override=self._block_translation[owner])
+                n = self._estimate_aabb_normal(p, lo, hi)
+            else:
+                ci = owner - self._num_aabb_obstacles
+                cyl = self._cylinders[ci]
+                n = self._estimate_cylinder_normal(p, cyl, translation_override=self._cylinder_translation[ci])
 
             # 将段放到“流体侧”一点点（沿 -n 方向内缩）
             p_in = p - inset * n

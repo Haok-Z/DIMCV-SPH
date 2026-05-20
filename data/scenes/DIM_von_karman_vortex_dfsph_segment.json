@@ -1,0 +1,169 @@
+{
+  "Configuration": {
+    "domainStart": [0.0, 0.0, 0.0],
+    "domainEnd": [4.0, 1.0, 1.0],
+    "deleteFluidParticlesOutsideDomain": true,
+    "domainCullMargin": 0.0,
+    "particleRadius": 0.0045,
+    "numberOfStepsPerRenderUpdate": 1,
+    "density0": 1000,
+    "simulationMethod": 2,
+    "gravitation": [0.0, 0.0, -9.8],
+    "timeStepSize": 0.002,
+    "stiffness": 50000,
+    "exponent": 7,
+    "boundaryHandlingMethod": 0,
+    "bounceBackBoundary": false,
+    "simulationTime": 10,
+    "vortexEnforcingDomainStart": [0.2, 0.0, 0.0],
+    "vortexEnforcingDomainEnd": [4.0, 1.0, 0.6],
+    "volumeScale": 0.2,
+    "GenProbPara": 5,
+    "DelProbPara": 3.5,
+    "reservedCapacity": 2000000,
+    "windowRes": [2048, 512, 512],
+    "divergenceTransitArea": [0.0, 0.02, 0.02],
+    "invisibleObjects": [1, 2, 2],
+    "exportPLY": true,
+    "exportPLYAxisConvention": "y_up"
+  },
+
+  "SegmentConfiguration": {
+    "domainStart": [0.6, 0.0, 0.02],
+    "domainEnd": [3.8, 1.0, 0.3],
+    "timeStepSize": 0.002,
+    "simulationTime": 12.0,
+    "segmentMaxNum": 120000,
+
+    "biotSavartModel": "finite_segment",
+    "regularizationRadiusR": 0.007,
+    "backgroundVelocity": [0.0, 0.0, 0.0],
+    "gammaDecay": 1.0,
+
+    "splitLengthThreshold": 0.2,
+    "mergeDistanceLambda": 0.08,
+    "mergeAngleThreshold": 4.6,
+    "deleteGammaThreshold": 0.0,
+    "deleteOutsideDomain": false,
+    "enableSplitSegments": true,
+    "enableMergeSegments": true,
+    "mergeRequireSameSegmentType": true,
+
+    "enableBoundaryInjection": false,
+
+    "initType": "parallel_x_layers",
+    "parallelXLayers": 3,
+    "parallelXFilamentsPerLayer": 15,
+    "parallelXSegmentsPerLine": 25,
+    "parallelXSegmentGap": 0.02,
+    "parallelXLayerAxis": "z",
+    "parallelXMargin": 0.05,
+    "parallelXFilamentGamma": 0.0,
+    "parallelXGammaAlternateFilament": true,
+    "parallelXGammaAlternateLayer": false,
+
+    "emitterEnabled": false,
+
+    "outflowDeleteCenterBeyondX": 3.96,
+
+    "imageExportSubfolderSph": "sph",
+    "imageExportSubfolderSegments": "segments",
+    "imageVorticityVmin": -40,
+    "imageVorticityVmax": 40,
+    "imageSegmentColormap": "coolwarm",
+    "imageSegmentLineWidth": 0.95,
+    "imageExportSegmentPanel": true,
+    "imageSegmentPanelIncludeSolid": true,
+
+    "exportSegmentPLY": true,
+    "exportPLYAxisConvention": "y_up",
+
+    "sphSegmentBsCoupling": 0.10,
+    "sphToSegmentGammaBlend": 0.07,
+    "sphToSegmentGammaProjection": "norm_signed",
+    "sphToSegmentDepositSource": "vorticity_vis",
+    "sphToSegmentGammaScale": 0.55,
+    "sphToSegmentDepositDebug": true,
+    "sphToSegmentDepositDebugInterval": 10
+  },
+
+  "FluidEmitters": [
+    {
+      "objectId": 0,
+      "squareCenter": [0.0, 0.5, 0.2],
+      "squareSize": [0.0, 0.94, 0.3],
+      "velocity": [2.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [50, 100, 200]
+    }
+  ],
+
+  "RigidBlocks": [
+    {
+      "objectId": 1,
+      "start": [0.0, 0.0, 0.0],
+      "end": [4.0, 0.02, 1.0],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [0.0, 0.0, 0.0],
+      "end": [4.0, 0.02, 1.0],
+      "translation": [0.0, 0.98, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [3.98, 0.02, 0.02],
+      "end": [4.0, 0.25, 1.0],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [3.98, 0.75, 0.02],
+      "end": [4.0, 0.98, 1.0],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [0.0, 0.0, 0.0],
+      "end": [4.0, 1.0, 0.03],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 2,
+      "start": [0.1, 0.1, 0.0],
+      "end": [1.5, 0.9, 0.9],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    }
+  ]
+}
