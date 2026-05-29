@@ -1,5 +1,6 @@
 import taichi as ti
 import numpy as np
+from typing import List, Set, Tuple
 
 from segment_boundary import SegmentBoundaryHandler
 
@@ -47,8 +48,16 @@ class SegmentSolver:
             self.ss.cfg.get_cfg("backgroundVelocity", [0.0, 0.0, 0.0]),
             dtype=np.float32,
         )
+        self.advection_background_velocity = self._build_advection_background_velocity()
+        self._advect_fix_segment_center = bool(
+            self.ss.cfg.get_cfg("advectFixSegmentCenter", False)
+        )
+        self._advect_fix_segment_length = bool(
+            self.ss.cfg.get_cfg("advectFixSegmentLength", False)
+        )
+        # 仅用于涡段端点 RK4 平流；对 SPH 的 BS 耦合见 accumulate_bs_*（不含此项）
         self.u_inf = ti.Vector.field(3, dtype=float, shape=())
-        self.u_inf.from_numpy(self.background_velocity)
+        self.u_inf.from_numpy(self.advection_background_velocity)
         self._grav_add = ti.Vector.field(3, dtype=float, shape=())
         gv = self._build_segment_gravity_velocity_numpy()
         # Taichi Vector(dtype=float) 为 f32；from_numpy 用 f64 会触发 Assign may lose precision 警告
@@ -104,6 +113,8 @@ class SegmentSolver:
             self._boundary_schedule = "each_step"
         self._boundary_one_shot_done = False
         self._sim_step_index = 0
+        self._emitter_interval_override = None
+        self._emitter_slot_cursor = 0
         self._emitter_rng = np.random.default_rng(
             int(self.ss.cfg.get_cfg("emitterSeed", 0) or 0)
         )
@@ -127,7 +138,7 @@ class SegmentSolver:
         self._fz_b = ti.field(dtype=ti.i32, shape=())
         self._fz_c = ti.field(dtype=ti.i32, shape=())
         self._fz_d = ti.field(dtype=ti.i32, shape=())
-        _fz_list: list[int] = []
+        _fz_list: List[int] = []
         if bool(self.ss.cfg.get_cfg("advectFreezeBoundarySegments", False)):
             _fz_list.append(int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2)))
         _extras = self.ss.cfg.get_cfg("advectFreezeSegmentTypeIds", None)
@@ -143,8 +154,60 @@ class SegmentSolver:
         self._fz_c[None] = _fz_list[2]
         self._fz_d[None] = _fz_list[3]
 
+    def _build_advection_background_velocity(self) -> np.ndarray:
+        """
+        涡段自身平流用的背景速度（写入端点速度/RK4）。
+
+        - ``segmentAdvectionBackgroundVelocity``：仅段平流（推荐与来流一致）
+        - ``backgroundVelocity``：边界最小二乘等；默认不再用于段平流，避免与 SPH 来流重复
+        - 未设 ``segmentAdvectionBackgroundVelocity`` 时，若
+          ``backgroundVelocityAffectsSegmentAdvection`` 为 true（默认 false），才回退到
+          ``backgroundVelocity``
+        """
+        adv = self.ss.cfg.get_cfg("segmentAdvectionBackgroundVelocity", None)
+        if adv is not None:
+            return np.asarray(adv, dtype=np.float32).reshape(-1)[:3]
+        affects = self.ss.cfg.get_cfg("backgroundVelocityAffectsSegmentAdvection", None)
+        if affects is None:
+            affects = True
+        if bool(affects):
+            return self.background_velocity.astype(np.float32, copy=True)
+        return np.zeros(3, dtype=np.float32)
+
+    def _boundary_type_id(self) -> int:
+        return int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2))
+
+    def _topology_skip_type_ids(self) -> Set[int]:
+        """
+        不参与 split / merge / delete 等拓扑操作的 seg_type。
+        boundarySkipTopology=true（默认）时自动包含 boundarySegmentTypeId。
+        """
+        skip: Set[int] = set()
+        if bool(self.ss.cfg.get_cfg("boundarySkipTopology", True)):
+            if self.has_boundary or bool(
+                self.ss.cfg.get_cfg("advectFreezeBoundarySegments", False)
+            ):
+                skip.add(self._boundary_type_id())
+        for key in (
+            "splitSkipSegmentTypeIds",
+            "mergeSkipSegmentTypeIds",
+            "deleteSkipSegmentTypeIds",
+        ):
+            extra = self.ss.cfg.get_cfg(key, None)
+            if extra is not None:
+                for x in extra:
+                    skip.add(int(x))
+        return skip
+
+    @staticmethod
+    def _skip_ids_for_kernel(skip: Set[int], slots: int = 4) -> Tuple[int, ...]:
+        ids = sorted(skip)[:slots]
+        while len(ids) < slots:
+            ids.append(-1)
+        return tuple(ids)
+
     @ti.func
-    def _advect_frozen(self, st: int) -> ti.i32:
+    def _advect_frozen(self, st: ti.i32) -> ti.i32:
         """若为 1，则该 seg_type 不参与 RK4/Euler 端点推进（仍参与 BS 诱导速度）。"""
         # Taichi：@ti.func 内不能在非 static 的 if 里 return，只能末尾单一 return
         out = 0
@@ -159,7 +222,7 @@ class SegmentSolver:
         return out
 
     @ti.func
-    def _segment_background(self, i: int):
+    def _segment_background(self, i: ti.i32):
         if ti.static(self.ss.dim == 2):
             u = ti.Vector([self.u_inf[None][0], self.u_inf[None][1]])
             if self._use_leapfrog_ring_bg[None] == 1:
@@ -230,8 +293,95 @@ class SegmentSolver:
         self.seed_initial_segments()
         self.ss.update_segment_geometry()
         if self.has_boundary and self._boundary_schedule == "initialize_only":
-            self._run_boundary_injection_pipeline(strip_committed_first=False)
-            self._boundary_one_shot_done = True
+            defer_sph = (
+                self.boundary._sample_source_is_sph()
+                and self.boundary._ps is not None
+                and not self.boundary.sph_boundary_sampling_ready()
+            )
+            if not defer_sph:
+                self._run_boundary_injection_pipeline(strip_committed_first=False)
+                self.boundary.mark_one_shot_complete_if_applicable(self)
+        if self._advect_fix_segment_length:
+            self.ss.update_segment_geometry()
+            self._snapshot_segment_ref_geometry()
+
+    @ti.kernel
+    def _snapshot_segment_ref_geometry(self):
+        """记录当前活跃段的参考段心与长度（用于固定几何投影）。"""
+        for i in range(self.ss.segment_num[None]):
+            if self.ss.active[i] != 1:
+                continue
+            xm = self.ss.x_minus[i]
+            xp = self.ss.x_plus[i]
+            self.ss.center_ref[i] = 0.5 * (xm + xp)
+            self.ss.length_ref[i] = (xp - xm).norm() + 1e-8
+
+    @ti.kernel
+    def _project_endpoints_fixed_ref_geometry(self):
+        """将端点投影到参考段心 + 参考长度，仅保留切向旋转。"""
+        for i in range(self.ss.segment_num[None]):
+            if self.ss.active[i] != 1:
+                continue
+            if self._advect_frozen(self.ss.seg_type[i]) == 1:
+                continue
+            C = self.ss.center_ref[i]
+            L = self.ss.length_ref[i]
+            d = self.ss.x_plus[i] - self.ss.x_minus[i]
+            dn = d.norm()
+            if dn < 1e-8:
+                continue
+            t = d / dn
+            half = 0.5 * L
+            self.ss.x_minus[i] = C - half * t
+            self.ss.x_plus[i] = C + half * t
+
+    @ti.kernel
+    def _snapshot_frozen_segment_geometry(self):
+        """记录冻结段（如边界虚拟段）的端点几何，供 merge 后复位。"""
+        for i in range(self.ss.segment_num[None]):
+            if self.ss.active[i] != 1:
+                continue
+            if self._advect_frozen(self.ss.seg_type[i]) != 1:
+                continue
+            xm = self.ss.x_minus[i]
+            xp = self.ss.x_plus[i]
+            self.ss.center_ref[i] = 0.5 * (xm + xp)
+            self.ss.length_ref[i] = (xp - xm).norm() + 1e-8
+
+    @ti.kernel
+    def _restore_frozen_segment_geometry(self):
+        """将冻结段端点恢复为提交时的参考几何（位置不变）。"""
+        for i in range(self.ss.segment_num[None]):
+            if self.ss.active[i] != 1:
+                continue
+            if self._advect_frozen(self.ss.seg_type[i]) != 1:
+                continue
+            C = self.ss.center_ref[i]
+            L = self.ss.length_ref[i]
+            d = self.ss.x_plus[i] - self.ss.x_minus[i]
+            dn = d.norm()
+            if dn < 1e-8:
+                if ti.static(self.ss.dim == 2):
+                    d = ti.Vector([1.0, 0.0])
+                else:
+                    d = ti.Vector([1.0, 0.0, 0.0])
+                dn = d.norm()
+            t = d / dn
+            half = 0.5 * L
+            self.ss.x_minus[i] = C - half * t
+            self.ss.x_plus[i] = C + half * t
+
+    def snapshot_frozen_segment_geometry(self):
+        if not bool(self.ss.cfg.get_cfg("boundarySnapshotFrozenGeometry", True)):
+            return
+        self.ss.update_segment_geometry()
+        self._snapshot_frozen_segment_geometry()
+
+    def restore_frozen_segment_geometry(self):
+        if not bool(self.ss.cfg.get_cfg("boundarySnapshotFrozenGeometry", True)):
+            return
+        self._restore_frozen_segment_geometry()
+        self.ss.update_segment_geometry()
 
     def _run_boundary_injection_pipeline(self, strip_committed_first: bool):
         """
@@ -239,14 +389,29 @@ class SegmentSolver:
         """
         if not self.has_boundary:
             return
+        if (
+            self.boundary._sample_source_is_sph()
+            and self.boundary._ps is not None
+            and not self.boundary.sph_boundary_sampling_ready()
+        ):
+            return
         if strip_committed_first:
             self._strip_segments_of_type(int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2)))
         self.boundary.update_boundary_pose()
-        self.boundary.generate_boundary_segments()
-        self.boundary.compute_k_matrix()
-        self.boundary.compute_rhs()
-        self.boundary.solve_linear_system()
-        self.boundary.commit_boundary_segments()
+        if self.boundary._uses_random_boundary_virtual():
+            self.boundary.generate_boundary_segments_random()
+            self.boundary.commit_boundary_segments()
+            self.boundary.release_vorticity_to_internal_segments()
+        else:
+            self.boundary.generate_boundary_segments()
+            self.boundary.compute_k_matrix()
+            self.boundary.compute_rhs()
+            self.boundary.solve_linear_system()
+            self.boundary.commit_boundary_segments()
+            self.boundary.release_vorticity_to_internal_segments()
+        self.ss.update_segment_geometry()
+        if self.boundary._last_boundary_commit_count > 0:
+            self.snapshot_frozen_segment_geometry()
 
     def seed_initial_segments(self):
         """
@@ -460,6 +625,33 @@ class SegmentSolver:
         )
         self.ss.segment_num[None] = offset + n_new
 
+    def _parallel_x_layout_bounds(self, margin: float):
+        """
+        parallel_x_layers 铺段用的轴对齐盒子 [lo, hi]（已加 margin 内缩）。
+
+        默认用 SegmentConfiguration.domainStart/End；
+        若设置 parallelXDomainStart / parallelXDomainEnd，则仅在该子域内生成
+        （再与全局 domain 求交，避免越界）。
+        """
+        d = self.ss.dim
+        dom_lo = self.ss.domain_start.astype(np.float64)
+        dom_hi = self.ss.domain_end.astype(np.float64)
+
+        box_lo = self.ss.cfg.get_cfg("parallelXDomainStart", None)
+        box_hi = self.ss.cfg.get_cfg("parallelXDomainEnd", None)
+        if box_lo is not None and box_hi is not None:
+            lo = np.asarray(box_lo, dtype=np.float64).reshape(-1)[:d]
+            hi = np.asarray(box_hi, dtype=np.float64).reshape(-1)[:d]
+            lo = np.maximum(lo, dom_lo[:d])
+            hi = np.minimum(hi, dom_hi[:d])
+        else:
+            lo = dom_lo[:d].copy()
+            hi = dom_hi[:d].copy()
+
+        lo = lo + margin
+        hi = hi - margin
+        return lo, hi
+
     def _seed_parallel_x_layers_filaments(self):
         """
         在 SegmentConfiguration.domainStart/End 盒子内，沿 +X 方向铺许多短涡段，
@@ -473,7 +665,10 @@ class SegmentSolver:
           段长 L = (可用 x 跨度 − (M−1)×gap) / M；gap=0 时与原先首尾相接一致
         - parallelXLayerAxis（默认 "z"）：层间分离轴，"z" 表示不同 z 平面为不同层，平行线在 y 向排开；
           "y" 则不同 y 为层，线在 z 向排开
-        - parallelXMargin（默认 0.06）：相对 domain 三轴内缩，避免段端点贴边
+        - parallelXMargin（默认 0.06）：相对铺段盒子三轴内缩，避免段端点贴边；
+          使用 parallelXDomainStart/End 时若需精确坐标，可设为 0
+        - parallelXDomainStart / parallelXDomainEnd（可选）：仅在此子域内铺平行涡段
+          （与 SegmentConfiguration.domain 求交）；未设则用全局 domain
         - parallelXFilamentGamma（默认 initGamma 或 0.0）
         - parallelXGammaAlternateFilament（默认 true）：相邻平行线 γ 取反（可选打破对称）
         - parallelXGammaAlternateLayer（默认 false）：相邻层 γ 再取反
@@ -493,11 +688,7 @@ class SegmentSolver:
         alt_f = bool(self.ss.cfg.get_cfg("parallelXGammaAlternateFilament", True))
         alt_L = bool(self.ss.cfg.get_cfg("parallelXGammaAlternateLayer", False))
 
-        lo = self.ss.domain_start.astype(np.float64) + margin
-        hi = self.ss.domain_end.astype(np.float64) - margin
-        if self.ss.dim == 2:
-            lo = np.array([lo[0], lo[1]], dtype=np.float64)
-            hi = np.array([hi[0], hi[1]], dtype=np.float64)
+        lo, hi = self._parallel_x_layout_bounds(margin)
         if lo[0] >= hi[0] or lo[1] >= hi[1]:
             raise ValueError(
                 "parallel_x_layers: domain too small after parallelXMargin; reduce margin or enlarge domain."
@@ -1168,10 +1359,12 @@ class SegmentSolver:
 
     def accumulate_bs_velocity_at_fluid_particles(self, ps, out_u, reg_radius: float):
         """
-        For each fluid particle at ``ps.x[p]``, sum induced velocity from all active
-        segments using the same finite-segment Biot–Savart as endpoint velocity.
+        For each fluid particle at ``ps.x[p]``, sum **pure Biot–Savart** from active segments.
 
-        Non-fluid indices are zeroed. Requires ``biotSavartModel: finite_segment``.
+        Does **not** add ``backgroundVelocity`` / ``segmentAdvectionBackgroundVelocity``
+        (SPH 流体已有入口 ``velocity``，避免来流重复叠加).
+
+        Non-fluid indices are zeroed.
         """
         if self._bs_2d_point:
             self._accumulate_bs_at_particles_2d_point(
@@ -1266,6 +1459,23 @@ class SegmentSolver:
                 u += inv4pi * Gamma * sc / (cross_sq + 1e-20) * cr
             out_u[p] = u
 
+    @ti.kernel
+    def _center_fix_velocity_pair(
+        self,
+        u_minus: ti.template(),
+        u_plus: ti.template(),
+    ):
+        """
+        去掉端点速度的共模分量 u_c = (u^- + u^+)/2，使 d/dt(center)=0。
+        保留相对运动，涡段可在原位旋转/伸缩，整体不平移。
+        """
+        for i in range(self.ss.segment_num[None]):
+            if self.ss.active[i] != 1:
+                continue
+            u_c = 0.5 * (u_minus[i] + u_plus[i])
+            u_minus[i] -= u_c
+            u_plus[i] -= u_c
+
     def advect_segments_rk4(self):
         """
         TODO：
@@ -1273,27 +1483,36 @@ class SegmentSolver:
             dx_minus/dt = u(x_minus)
             dx_plus/dt  = u(x_plus)
 
-        建议分阶段实现：
-        - 先用临时 Euler 版本打通流程
-        - u_at_point 就绪后替换为完整 RK4
+        SegmentConfiguration.advectFixSegmentCenter=true 时：
+            dx^±/dt = u(x^±) - (u(x^-) + u(x^+))/2  （段心固定，仅相对运动）
         """
         # 1) k1：在当前端点位置计算速度
         self._copy_v_to_k1()
+        if self._advect_fix_segment_center:
+            self._center_fix_velocity_pair(self.k1_minus, self.k1_plus)
 
         # 2) k2：在 x + 0.5*dt*k1 位置计算速度
         self._velocity_at_factor_dispatch(0.5, self.k1_minus, self.k1_plus,
                                           self.k2_minus, self.k2_plus)
+        if self._advect_fix_segment_center:
+            self._center_fix_velocity_pair(self.k2_minus, self.k2_plus)
 
         # 3) k3：在 x + 0.5*dt*k2 位置计算速度
         self._velocity_at_factor_dispatch(0.5, self.k2_minus, self.k2_plus,
                                           self.k3_minus, self.k3_plus)
+        if self._advect_fix_segment_center:
+            self._center_fix_velocity_pair(self.k3_minus, self.k3_plus)
 
         # 4) k4：在 x + dt*k3 位置计算速度
         self._velocity_at_factor_dispatch(1.0, self.k3_minus, self.k3_plus,
                                           self.k4_minus, self.k4_plus)
+        if self._advect_fix_segment_center:
+            self._center_fix_velocity_pair(self.k4_minus, self.k4_plus)
 
         # 5) 更新端点位置并推进 gamma / age
         self._update_endpoints_rk4()
+        if self._advect_fix_segment_length:
+            self._project_endpoints_fixed_ref_geometry()
 
     @ti.kernel
     def _advect_segments_euler_placeholder(self):
@@ -1525,12 +1744,21 @@ class SegmentSolver:
         age = self.ss.age.to_numpy()[:n].astype(np.float32)
         seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
 
-        keep = (active == 1) & (np.abs(gamma) >= float(self.delete_gamma_threshold))
+        skip_topo = self._topology_skip_type_ids()
+        keep = active == 1
+        if bool(self.ss.cfg.get_cfg("enableDeleteWeakSegments", True)):
+            keep &= np.abs(gamma) >= float(self.delete_gamma_threshold)
+        if len(skip_topo) > 0:
+            keep |= np.isin(seg_type, list(skip_topo))
 
         ofx = self.ss.cfg.get_cfg("outflowDeleteCenterBeyondX", None)
         if ofx is not None:
             mid_x = 0.5 * (x_minus[:, 0] + x_plus[:, 0])
-            keep &= mid_x <= float(ofx)
+            outflow = mid_x > float(ofx)
+            if len(skip_topo) > 0:
+                keep &= (~outflow) | np.isin(seg_type, list(skip_topo))
+            else:
+                keep &= ~outflow
 
         # 可选：按年龄删除
         max_age = self.ss.cfg.get_cfg("deleteMaxAge", None)
@@ -1549,7 +1777,10 @@ class SegmentSolver:
             in_p = np.all(
                 (x_plus[:, :d] >= lo[None, :]) & (x_plus[:, :d] <= hi[None, :]), axis=1
             )
-            keep &= (in_m & in_p)
+            inside_keep = in_m & in_p
+            if len(skip_topo) > 0:
+                inside_keep |= np.isin(seg_type, list(skip_topo))
+            keep &= inside_keep
 
         idx = np.nonzero(keep)[0]
         new_n = int(idx.size)
@@ -1588,14 +1819,7 @@ class SegmentSolver:
         old_n = int(self.ss.segment_num[None])
         if old_n <= 0:
             return
-        skip = self.ss.cfg.get_cfg("splitSkipSegmentTypeIds", None)
-        if skip is None or (isinstance(skip, (list, tuple)) and len(skip) == 0):
-            sa, sb, sc, sd = -1, -1, -1, -1
-        else:
-            ids = [int(x) for x in skip][:4]
-            while len(ids) < 4:
-                ids.append(-1)
-            sa, sb, sc, sd = ids[0], ids[1], ids[2], ids[3]
+        sa, sb, sc, sd = self._skip_ids_for_kernel(self._topology_skip_type_ids())
         self._split_segments_kernel(old_n, float(self.split_len_threshold), sa, sb, sc, sd)
 
     @ti.kernel
@@ -1689,6 +1913,7 @@ class SegmentSolver:
         merge_angle = float(self.ss.cfg.get_cfg("mergeAngleThreshold", 5.0 * np.pi / 6.0))
         # 近反向：dot(t_i, t_j) <= cos(theta)，theta 接近 pi 时更严格
         dot_th = float(np.cos(merge_angle))
+        skip_merge_types = self._topology_skip_type_ids()
 
         x_minus = self.ss.x_minus.to_numpy()[:n].astype(np.float32)
         x_plus = self.ss.x_plus.to_numpy()[:n].astype(np.float32)
@@ -1710,6 +1935,14 @@ class SegmentSolver:
         for i in range(n):
             if active[i] != 1 or used[i]:
                 continue
+            if int(seg_type[i]) in skip_merge_types:
+                used[i] = True
+                out_xm.append(x_minus[i])
+                out_xp.append(x_plus[i])
+                out_g.append(gamma[i])
+                out_a.append(age[i])
+                out_t.append(seg_type[i])
+                continue
 
             # 找到可合并的最佳候选 j（最近）
             best_j = -1
@@ -1718,6 +1951,8 @@ class SegmentSolver:
             ti = tangent[i]
             for j in range(i + 1, n):
                 if active[j] != 1 or used[j]:
+                    continue
+                if int(seg_type[j]) in skip_merge_types:
                     continue
                 if bool(self.ss.cfg.get_cfg("mergeRequireSameSegmentType", False)):
                     if int(seg_type[i]) != int(seg_type[j]):
@@ -1918,19 +2153,14 @@ class SegmentSolver:
         )
         self.ss.segment_num[None] = new_n
 
-    def _emit_inlet_segments(self):
-        if not bool(self.ss.cfg.get_cfg("emitterEnabled", False)):
-            return
-        interval = max(1, int(self.ss.cfg.get_cfg("emitterIntervalSteps", 1)))
-        if int(self._sim_step_index) % interval != 0:
-            return
-
+    def _resolve_emitter_inlet_bounds(self):
+        """与 FluidEmitters[0] 或 emitterX/Y0/Y1 对齐的入口铺段区域。"""
         use_fe = bool(self.ss.cfg.get_cfg("emitterUseFluidEmitterLayout", True))
         emitters = self.ss.cfg.get_inflow() if hasattr(self.ss.cfg, "get_inflow") else []
         if use_fe and len(emitters) > 0:
             e0 = emitters[0]
-            c = np.array(e0["squareCenter"], dtype=np.float64)
-            s = np.array(e0["squareSize"], dtype=np.float64)
+            c = np.array(e0["squareCenter"], dtype=np.float64).reshape(-1)
+            s = np.array(e0["squareSize"], dtype=np.float64).reshape(-1)
             lo = c - 0.5 * s
             hi = c + 0.5 * s
             if float(s[0]) < 1e-8:
@@ -1938,23 +2168,128 @@ class SegmentSolver:
             else:
                 x_emit = float(0.5 * (lo[0] + hi[0]))
             y0, y1 = float(lo[1]), float(hi[1])
-            z0, z1 = float(lo[2]), float(hi[2])
+            if self.ss.dim >= 3 and s.size >= 3:
+                z0, z1 = float(lo[2]), float(hi[2])
+            else:
+                z0, z1 = 0.0, 0.0
         else:
             x_emit = float(self.ss.cfg.get_cfg("emitterX", 0.05))
             y0 = float(self.ss.cfg.get_cfg("emitterY0", 0.1))
             y1 = float(self.ss.cfg.get_cfg("emitterY1", 0.9))
             z0 = float(self.ss.cfg.get_cfg("emitterZ0", 0.1))
             z1 = float(self.ss.cfg.get_cfg("emitterZ1", 0.9))
+        return x_emit, y0, y1, z0, z1
 
-        # 沿 z 的涡线（固定 y、x），在 y 方向堆叠 ny 条；可选沿 z 再细分为多段。
-        ny = max(1, int(self.ss.cfg.get_cfg("emitterNy", self.ss.cfg.get_cfg("emitterMeshNy", 12))))
-        nz_sub = int(
-            self.ss.cfg.get_cfg(
-                "emitterSubdivisionsZ",
-                self.ss.cfg.get_cfg("emitterMeshNz", 1),
-            )
+    def _emitter_gamma_sign_for_y_slot(self, iy: int, ny: int) -> float:
+        mode = str(self.ss.cfg.get_cfg("emitterGammaYMode", "alternate") or "alternate").lower().strip()
+        if mode in ("split_half", "half", "y_half", "upper_lower", "front_back_half"):
+            split = int(self.ss.cfg.get_cfg("emitterGammaYSplitIndex", max(1, ny // 2)))
+            split = max(1, min(int(ny), split))
+            first_sign = float(self.ss.cfg.get_cfg("emitterGammaFirstHalfSign", 1.0))
+            return first_sign if int(iy) < split else -first_sign
+        alternate_y = bool(self.ss.cfg.get_cfg("emitterGammaAlternateY", True))
+        return 1.0 if (not alternate_y or (int(iy) % 2) == 0) else -1.0
+
+    def _emit_inlet_segments_streamwise_x(
+        self, x_emit: float, y0: float, y1: float
+    ):
+        """2D：在入口 x 平面铺沿 +X 的短涡段（与来流平行），y 向均匀排布。"""
+        ny = max(
+            1,
+            int(
+                self.ss.cfg.get_cfg(
+                    "emitterNy", self.ss.cfg.get_cfg("emitterMeshNy", 12)
+                )
+            ),
         )
-        nz_sub = max(1, nz_sub)
+        nx_sub = max(
+            1,
+            int(
+                self.ss.cfg.get_cfg(
+                    "emitterSubdivisionsX",
+                    self.ss.cfg.get_cfg("emitterMeshNx", 1),
+                )
+            ),
+        )
+        nx_cap = int(self.ss.cfg.get_cfg("emitterSegmentsPerYPerEmit", 0))
+        if nx_cap > 0:
+            nx_sub = min(nx_sub, nx_cap)
+        seg_len = float(self.ss.cfg.get_cfg("emitterSegmentLength", 0.018))
+        g0 = float(self.ss.cfg.get_cfg("emitterGamma", 0.02))
+        st = int(self.ss.cfg.get_cfg("emitterSegTypeId", 0))
+        jy_cfg = self.ss.cfg.get_cfg("emitterYJitter", None)
+        if jy_cfg is not None:
+            jyz = float(jy_cfg)
+        else:
+            jyz = float(self.ss.cfg.get_cfg("emitterJitterYZ", 0.0))
+        alternate_y = bool(self.ss.cfg.get_cfg("emitterGammaAlternateY", True))
+
+        ys = np.linspace(y0, y1, ny, dtype=np.float32)
+        if jyz > 0.0:
+            ys = ys + self._emitter_rng.uniform(-jyz, jyz, size=ny).astype(np.float32)
+            ys = np.clip(
+                ys,
+                float(self.ss.domain_start[1]) + 1e-4,
+                float(self.ss.domain_end[1]) - 1e-4,
+            )
+
+        xm_list = []
+        xp_list = []
+        g_list = []
+        for iy in range(ny):
+            yj = float(ys[iy])
+            sgn_y = self._emitter_gamma_sign_for_y_slot(iy, ny)
+            for _ in range(nx_sub):
+                xm_list.append([x_emit - 0.5 * seg_len, yj, 0.0])
+                xp_list.append([x_emit + 0.5 * seg_len, yj, 0.0])
+                g_list.append(float(sgn_y * g0))
+
+        xm_list, xp_list, g_list = self._select_emit_batch(xm_list, xp_list, g_list)
+        self._commit_emitted_segments(xm_list, xp_list, g_list, st)
+
+    def _select_emit_batch(self, xm_list, xp_list, g_list):
+        """
+        可选限制单次发射总段数（默认 0 = 不限制）。
+
+        2D 入口典型用法：y 向 ``emitterNy`` 个发射口同时各放 1 段（``emitterSubdivisionsX: 1``、
+        ``emitterSegmentsPerYPerEmit: 1``），用 ``emitterIntervalSteps`` / ``emitterIntervalStride``
+        控制时间频率；不要用 round_robin 关掉多 y 口。
+        """
+        n = len(xm_list)
+        if n <= 0:
+            return xm_list, xp_list, g_list
+        max_per = int(self.ss.cfg.get_cfg("emitterMaxSegmentsPerEmit", 0))
+        if max_per <= 0:
+            return xm_list, xp_list, g_list
+        mode = str(self.ss.cfg.get_cfg("emitterBatchMode", "all") or "all").lower().strip()
+        max_per = min(max_per, n)
+        if mode in ("round_robin", "sequential", "one", "single"):
+            idx = int(self._emitter_slot_cursor) % n
+            self._emitter_slot_cursor = (idx + 1) % n
+            return [xm_list[idx]], [xp_list[idx]], [g_list[idx]]
+        return xm_list[:max_per], xp_list[:max_per], g_list[:max_per]
+
+    def _emit_inlet_segments_spanwise_z(
+        self, x_emit: float, y0: float, y1: float, z0: float, z1: float
+    ):
+        """3D：沿 z 的涡线（固定 x、y），在 y 方向堆叠。"""
+        ny = max(
+            1,
+            int(
+                self.ss.cfg.get_cfg(
+                    "emitterNy", self.ss.cfg.get_cfg("emitterMeshNy", 12)
+                )
+            ),
+        )
+        nz_sub = max(
+            1,
+            int(
+                self.ss.cfg.get_cfg(
+                    "emitterSubdivisionsZ",
+                    self.ss.cfg.get_cfg("emitterMeshNz", 1),
+                )
+            ),
+        )
         g0 = float(self.ss.cfg.get_cfg("emitterGamma", 0.02))
         st = int(self.ss.cfg.get_cfg("emitterSegTypeId", 0))
         jy_cfg = self.ss.cfg.get_cfg("emitterYJitter", None)
@@ -1968,33 +2303,36 @@ class SegmentSolver:
         zs = np.linspace(z0, z1, nz_sub + 1, dtype=np.float32)
         if jyz > 0.0:
             ys = ys + self._emitter_rng.uniform(-jyz, jyz, size=ny).astype(np.float32)
-            ys = np.clip(ys, float(self.ss.domain_start[1]) + 1e-4, float(self.ss.domain_end[1]) - 1e-4)
+            ys = np.clip(
+                ys,
+                float(self.ss.domain_start[1]) + 1e-4,
+                float(self.ss.domain_end[1]) - 1e-4,
+            )
 
         xm_list = []
         xp_list = []
         g_list = []
         for iy in range(ny):
             yj = float(ys[iy])
-            if alternate_y:
-                sgn_y = 1.0 if (iy % 2) == 0 else -1.0
-            else:
-                sgn_y = 1.0
+            sgn_y = self._emitter_gamma_sign_for_y_slot(iy, ny)
             for iz in range(nz_sub):
-                # 与旧版一致：alternate 关则全部为 +gamma；开则仅按 y 索引交替（与 z 向分段数无关）
                 sgn = sgn_y if alternate_y else 1.0
                 z0s = float(zs[iz])
                 z1s = float(zs[iz + 1])
                 xm_list.append([x_emit, yj, z0s])
                 xp_list.append([x_emit, yj, z1s])
-                g_list.append(sgn * g0)
+                g_list.append(float(sgn * g0))
 
+        xm_list, xp_list, g_list = self._select_emit_batch(xm_list, xp_list, g_list)
+        self._commit_emitted_segments(xm_list, xp_list, g_list, st)
+
+    def _commit_emitted_segments(self, xm_list, xp_list, g_list, seg_type: int):
         n_seg = len(xm_list)
         if n_seg <= 0:
             return
         xm = np.asarray(xm_list, dtype=np.float32)
         xp = np.asarray(xp_list, dtype=np.float32)
         g = np.asarray(g_list, dtype=np.float32)
-
         offset = int(self.ss.segment_num[None])
         cap = int(self.ss.segment_max_num)
         if offset >= cap:
@@ -2002,8 +2340,35 @@ class SegmentSolver:
         n_new = min(n_seg, cap - offset)
         if n_new <= 0:
             return
-        self._seed_segments_kernel(offset, n_new, xm[:n_new], xp[:n_new], g[:n_new], st)
+        self._seed_segments_kernel(
+            offset, n_new, xm[:n_new], xp[:n_new], g[:n_new], seg_type
+        )
         self.ss.segment_num[None] = offset + n_new
+
+    def _emit_inlet_segments(self):
+        if not bool(self.ss.cfg.get_cfg("emitterEnabled", False)):
+            return
+        stride = max(1, int(self.ss.cfg.get_cfg("emitterIntervalStride", 1)))
+        if self._emitter_interval_override is not None:
+            interval = max(1, int(self._emitter_interval_override)) * stride
+        else:
+            interval = max(
+                1, int(self.ss.cfg.get_cfg("emitterIntervalSteps", 1))
+            ) * stride
+        if int(self._sim_step_index) % interval != 0:
+            return
+
+        x_emit, y0, y1, z0, z1 = self._resolve_emitter_inlet_bounds()
+        orient = str(
+            self.ss.cfg.get_cfg("emitterOrientation", "") or ""
+        ).lower().strip()
+        if not orient:
+            orient = "streamwise_x" if self.ss.dim == 2 else "spanwise_z"
+
+        if orient in ("streamwise_x", "x", "along_x", "2d_inlet"):
+            self._emit_inlet_segments_streamwise_x(x_emit, y0, y1)
+        else:
+            self._emit_inlet_segments_spanwise_z(x_emit, y0, y1, z0, z1)
 
     def step(self):
         """
@@ -2022,7 +2387,7 @@ class SegmentSolver:
             elif not self._boundary_one_shot_done:
                 strip = bool(self.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False))
                 self._run_boundary_injection_pipeline(strip_committed_first=strip)
-                self._boundary_one_shot_done = True
+                self.boundary.mark_one_shot_complete_if_applicable(self)
 
         self._emit_inlet_segments()
         self.ss.update_segment_geometry()
@@ -2031,6 +2396,7 @@ class SegmentSolver:
         self.ss.update_segment_geometry()
         self.split_segments()
         self.merge_segments()
+        self.restore_frozen_segment_geometry()
         self.delete_weak_segments()
         # 初始脉冲只生效一个时间步
         if self._use_leapfrog_initial_impulse[None] == 1:

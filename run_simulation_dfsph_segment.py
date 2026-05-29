@@ -34,7 +34,8 @@ def main():
     parser.add_argument(
         "--scene_file",
         default="./data/scenes/DIM_von_karman_vortex_2d_dfsph_segment.json",
-        help="JSON with Configuration + SegmentConfiguration (2D: domainStart/End length 2)",
+        help="JSON with Configuration + SegmentConfiguration. "
+        "Emit-only experiment: DIM_von_karman_vortex_2d_dfsph_segment_emit_bs.json",
     )
     image_path = Path("result_images_dfsph_seg")
     if image_path.exists():

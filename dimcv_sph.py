@@ -586,13 +586,19 @@ class DIMCVSPHSolver(SPHBase):
         self.pressure_solve_iteration_kernel()
         self.compute_density_adv()
         density_err = self.compute_density_error(self.density_0)
-        return density_err / self.ps.fluid_particle_num[None]
+        n_fluid = int(self.ps.fluid_particle_num[None])
+        if n_fluid <= 0:
+            return 0.0
+        return density_err / n_fluid
 
     def divergence_solver_iteration(self):
         self.divergence_solver_iteration_kernel()
         self.compute_density_change()
         density_err = self.compute_density_error(0.0)
-        return density_err / self.ps.fluid_particle_num[None]
+        n_fluid = int(self.ps.fluid_particle_num[None])
+        if n_fluid <= 0:
+            return 0.0
+        return density_err / n_fluid
 
     def pressure_solve(self):
         inv_dt2 = self.inv_dt2
@@ -622,8 +628,15 @@ class DIMCVSPHSolver(SPHBase):
             density = emitter["density"]
             color = emitter["color"]
             lower_corner = squareCenter - 0.5 * squareSize
-            cube_size = squareSize + self.ps.particle_radius * np.abs(
-                init_v) / np.linalg.norm(init_v)
+            speed = float(np.linalg.norm(init_v))
+            cube_size = np.array(squareSize, dtype=np.float64)
+            if speed > 1e-12:
+                cube_size = cube_size + self.ps.particle_diameter * (
+                    np.abs(init_v) / speed
+                )
+            for d in range(self.ps.dim):
+                if cube_size[d] < self.ps.particle_diameter:
+                    cube_size[d] = float(self.ps.particle_diameter)
             # Match bookkeeping to actual inserts: add_cube may add fewer than
             # compute_cube_particle_num when particle_num approaches particle_max_num.
             pn_before = int(self.ps.particle_num[None])

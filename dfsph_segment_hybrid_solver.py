@@ -4,9 +4,12 @@ DFSPH Kármán solver coupled with Lagrangian vortex segments (research prototyp
 Pipeline each ``substep`` (same ``dt`` as SPH):
   1) Standard DFSPH through ``pressure_solve``.
   2) ``compute_vorticity`` — SPH estimate ω from velocity (same formulation as DIMCV).
-  3) Segment subsystem: emit → geometry → relax γ toward kernel-weighted SPH ω at segment
-     centers (projection configurable: ω·t̂ vs ‖ω‖ for random segments) → BS → RK4 → topology.
+  3) Segment subsystem: optional inlet emit → optional SPH ω deposit → BS → RK4 → topology.
   4) Biot–Savart induced velocity at fluid particle positions → add ``β u_BS`` to ``ps.v``.
+
+  Experiment ``sphToSegmentDepositEnabled: false`` + ``emitterEnabled: true`` (2D
+  ``emitterOrientation: streamwise_x``): segments inject at the fluid inlet like particles,
+  evolve with BS/background only, and drive SPH via β coupling (no ω→γ deposit).
 
 Coupling parameters live under ``SegmentConfiguration`` in the scene JSON:
 
@@ -20,14 +23,15 @@ Coupling parameters live under ``SegmentConfiguration`` in the scene JSON:
 
 Notes:
   • Correction after ``pressure_solve`` is not divergence-free; treat as vorticity-style boost.
-  • Segment advection uses BS + ``backgroundVelocity`` only (no SPH interpolation at endpoints yet).
+  • Segment advection: BS + ``segmentAdvectionBackgroundVelocity`` (RK4 端点速度);
+    ``backgroundVelocity`` 用于边界 RHS 等，默认 **不** 叠加到 SPH 的 BS 耦合。
   • For ``initType: random_uniform`` with ``randomGammaInitial: 0``, set ``deleteGammaThreshold: 0``
     so weak segments are not culled before SPH deposits circulation.
   • Requires ``SimConfig.scene_file_path`` and a ``SegmentConfiguration`` block in that JSON.
   • Use ``simulationMethod``: 2 with e.g. ``DIM_von_karman_vortex_dfsph_segment.json``.
   • PNG: ``<image_path>/sph/vorticity_XXXX.png`` (fluid + cylinder, no segments) and
-    ``<image_path>/segments/vorticity_XXXX.png`` (segments colored by kernel-weighted
-    ``vorticity_vis.z`` at segment center, same colormap / ``imageVorticityVmin`` / ``Max`` as SPH;
+    ``<image_path>/segments/vorticity_XXXX.png`` (interior segments by ``vorticity_vis.z``;
+    boundary virtual segments in ``imageBoundarySegmentColor`` if ``imageShowBoundarySegments``;
     optional cylinder via ``imageSegmentPanelIncludeSolid``).
   • When ``exportPLY`` runs for particles, ``exportSegmentPLY`` (SegmentConfiguration, default true)
     also writes ``segments_XXXX.ply`` beside ``frame_XXXX.ply``.
@@ -39,7 +43,7 @@ import taichi as ti
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, to_rgba
 from matplotlib.collections import LineCollection
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
@@ -62,6 +66,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self.seg_cfg = SegmentConfig(scene_file_path=path)
         self.ss_seg = SegmentSystem(self.seg_cfg)
         self.seg_solver = SegmentSolver(self.ss_seg)
+        if self.seg_solver.has_boundary:
+            self.seg_solver.boundary.set_particle_system(particle_system)
 
         self.segment_bs_coupling_beta = float(
             self.seg_cfg.get_cfg("sphSegmentBsCoupling", 0.12)
@@ -69,9 +75,17 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self.sph_to_segment_blend = float(
             self.seg_cfg.get_cfg("sphToSegmentGammaBlend", 0.06)
         )
+        _dep_en = self.seg_cfg.get_cfg("sphToSegmentDepositEnabled", None)
+        if _dep_en is None:
+            self._sph_to_segment_deposit_enabled = self.sph_to_segment_blend > 0.0
+        else:
+            self._sph_to_segment_deposit_enabled = bool(_dep_en)
         self.sph_to_segment_gamma_scale = float(
             self.seg_cfg.get_cfg("sphToSegmentGammaScale", 5e-4)
         )
+        self._deposit_skip_seg_type = int(
+            self.seg_cfg.get_cfg("boundarySegmentTypeId", 2)
+        ) if bool(self.seg_cfg.get_cfg("sphToSegmentDepositSkipBoundary", True)) else -1
         _proj = str(
             self.seg_cfg.get_cfg("sphToSegmentGammaProjection", "tangential")
             or "tangential"
@@ -140,6 +154,20 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
     def initialize(self):
         super().initialize()
         self.seg_solver.initialize()
+        if bool(self.seg_cfg.get_cfg("emitterSyncFluidEmitInterval", False)):
+            self.seg_solver._emitter_interval_override = max(
+                1, int(self.emit_interval)
+            )
+        # 若 initialize_only 在 seg_solver.initialize 内未成功提交，下一步再试
+        ssol = self.seg_solver
+        if (
+            ssol.has_boundary
+            and int(self.ss_seg.segment_num[None]) == 0
+            and not ssol._boundary_one_shot_done
+        ):
+            ssol._run_boundary_injection_pipeline(strip_committed_first=False)
+            ssol.boundary.mark_one_shot_complete_if_applicable(ssol)
+            self.ss_seg.update_segment_geometry()
 
     def _advance_segments_coupled(self):
         ssol = self.seg_solver
@@ -154,31 +182,34 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     ssol.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False)
                 )
                 ssol._run_boundary_injection_pipeline(strip_committed_first=strip)
-                ssol._boundary_one_shot_done = True
+                ssol.boundary.mark_one_shot_complete_if_applicable(ssol)
 
         ssol._emit_inlet_segments()
         ssol.ss.update_segment_geometry()
         dbg_deposit = 0
-        if self._deposit_debug:
-            self._deposit_debug_step += 1
-            if self._deposit_debug_step % self._deposit_debug_interval == 0:
-                dbg_deposit = 1
-                self._deposit_debug_reset()
-        self._deposit_vorticity_to_segments_kernel(
-            float(self.sph_to_segment_blend),
-            float(self.sph_to_segment_gamma_scale),
-            int(self.ps.material_fluid),
-            int(self._deposit_gamma_proj),
-            int(self._deposit_src_vis),
-            dbg_deposit,
-        )
-        if dbg_deposit:
-            self._print_deposit_debug_maxima()
+        if self._sph_to_segment_deposit_enabled and self.sph_to_segment_blend > 0.0:
+            if self._deposit_debug:
+                self._deposit_debug_step += 1
+                if self._deposit_debug_step % self._deposit_debug_interval == 0:
+                    dbg_deposit = 1
+                    self._deposit_debug_reset()
+            self._deposit_vorticity_to_segments_kernel(
+                float(self.sph_to_segment_blend),
+                float(self.sph_to_segment_gamma_scale),
+                int(self.ps.material_fluid),
+                int(self._deposit_gamma_proj),
+                int(self._deposit_src_vis),
+                dbg_deposit,
+                int(self._deposit_skip_seg_type),
+            )
+            if dbg_deposit:
+                self._print_deposit_debug_maxima()
         ssol.compute_endpoint_velocity()
         ssol.advect_segments_rk4()
         ssol.ss.update_segment_geometry()
         ssol.split_segments()
         ssol.merge_segments()
+        ssol.restore_frozen_segment_geometry()
         ssol.delete_weak_segments()
         if ssol._use_leapfrog_initial_impulse[None] == 1:
             ssol._decay_impulse_kernel()
@@ -223,11 +254,14 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         proj_mode: ti.i32,
         src_vis: ti.i32,
         dbg: ti.i32,
+        skip_seg_type: ti.i32,
     ):
         h = self.ps.support_radius
         nseg = self.ss_seg.segment_num[None]
         for i in range(nseg):
             if self.ss_seg.active[i] != 1:
+                continue
+            if skip_seg_type >= 0 and self.ss_seg.seg_type[i] == skip_seg_type:
                 continue
             xc = self.ss_seg.center[i]
             omega_acc_z = 0.0
@@ -270,11 +304,14 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         proj_mode: ti.i32,
         src_vis: ti.i32,
         dbg: ti.i32,
+        skip_seg_type: ti.i32,
     ):
         h = self.ps.support_radius
         nseg = self.ss_seg.segment_num[None]
         for i in range(nseg):
             if self.ss_seg.active[i] != 1:
+                continue
+            if skip_seg_type >= 0 and self.ss_seg.seg_type[i] == skip_seg_type:
                 continue
             xc = self.ss_seg.center[i]
             tdir = self.ss_seg.tangent[i]
@@ -324,14 +361,15 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         proj_mode: ti.i32,
         src_vis: ti.i32,
         dbg: ti.i32,
+        skip_seg_type: int,
     ):
         if self.ps.dim == 2:
             self._deposit_vorticity_to_segments_2d_kernel(
-                blend, gamma_scale, mf, proj_mode, src_vis, dbg
+                blend, gamma_scale, mf, proj_mode, src_vis, dbg, int(skip_seg_type)
             )
         else:
             self._deposit_vorticity_to_segments_3d_kernel(
-                blend, gamma_scale, mf, proj_mode, src_vis, dbg
+                blend, gamma_scale, mf, proj_mode, src_vis, dbg, int(skip_seg_type)
             )
 
     @ti.kernel
@@ -391,6 +429,164 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 wsum += w
             if wsum > 1e-12:
                 self._seg_vis_scalar[i] = acc / wsum
+
+    def _boundary_segment_draw_style(self):
+        """边界虚拟段 PNG 样式（与 segment_export 配置项一致）。"""
+        btype = int(self.seg_cfg.get_cfg("boundarySegmentTypeId", 2))
+        show = bool(self.seg_cfg.get_cfg("imageShowBoundarySegments", True))
+        raw = self.seg_cfg.get_cfg("imageBoundarySegmentColor", [255, 165, 0])
+        if raw is None:
+            raw = [255, 165, 0]
+        arr = np.asarray(raw, dtype=np.float64).ravel()
+        if arr.size >= 3 and float(np.max(arr)) > 1.0:
+            color = (arr[:3] / 255.0).astype(np.float64)
+        else:
+            color = arr[:3] if arr.size >= 3 else np.array([1.0, 0.65, 0.0])
+        lw_cfg = self.seg_cfg.get_cfg("imageBoundarySegmentLineWidth", None)
+        lw = float(lw_cfg) if lw_cfg is not None else self._export_seg_line_width * 1.35
+        alpha = float(self.seg_cfg.get_cfg("imageBoundarySegmentAlpha", 0.95))
+        return btype, show, tuple(color.tolist()), lw, alpha
+
+    def _active_segment_index_groups(self, n_seg: int):
+        """将活跃段分为内部段与边界虚拟段索引。"""
+        if n_seg <= 0:
+            return (
+                np.zeros((0,), dtype=np.int64),
+                np.zeros((0,), dtype=np.int64),
+            )
+        act = self.ss_seg.active.to_numpy()[:n_seg]
+        idx = np.nonzero(act == 1)[0]
+        if idx.size == 0:
+            return idx, idx
+        btype, show_bnd, _, _, _ = self._boundary_segment_draw_style()
+        if not show_bnd:
+            return idx, np.zeros((0,), dtype=np.int64)
+        seg_type = self.ss_seg.seg_type.to_numpy()[:n_seg]
+        is_bnd = seg_type[idx] == btype
+        return idx[~is_bnd], idx[is_bnd]
+
+    def _segment_line_width_for_export(self) -> float:
+        return float(
+            self.seg_cfg.get_cfg("imageSegmentLineWidth", self._export_seg_line_width)
+        )
+
+    def _add_interior_segments_2d(self, ax, xm, xp, idx, scalars, vnorm):
+        if idx.size == 0:
+            return
+        segments = self._segment_polylines_2d(xm, xp, idx)
+        lw = self._segment_line_width_for_export()
+        seg_alpha = float(self.seg_cfg.get_cfg("imageSegmentLineAlpha", 0.92))
+        if bool(self.seg_cfg.get_cfg("imageSegmentDrawWhiteUnderlay", False)):
+            under_lw = float(
+                self.seg_cfg.get_cfg(
+                    "imageSegmentWhiteUnderlayLineWidth", lw * 1.35
+                )
+            )
+            under_a = float(self.seg_cfg.get_cfg("imageSegmentWhiteUnderlayAlpha", 0.55))
+            ax.add_collection(
+                LineCollection(
+                    segments,
+                    colors=(1.0, 1.0, 1.0, under_a),
+                    linewidths=under_lw,
+                    zorder=3,
+                    capstyle="round",
+                )
+            )
+        lc = LineCollection(
+            segments,
+            array=scalars.astype(np.float64),
+            cmap=self._segment_cmap,
+            norm=vnorm,
+            linewidths=lw,
+            alpha=seg_alpha,
+            zorder=4,
+            capstyle="round",
+        )
+        ax.add_collection(lc)
+
+    def _segment_polylines_2d(self, xm, xp, idx):
+        """每条段为 (2,2) 折线；兼容 Taichi 2D 端点 (n,2)。"""
+        segs = np.stack([xm[idx], xp[idx]], axis=1)
+        if segs.shape[-1] > 2:
+            segs = segs[:, :, :2]
+        return [np.asarray(s, dtype=np.float64) for s in segs]
+
+    def _add_boundary_segments_2d(self, ax, xm, xp, idx):
+        if idx.size == 0:
+            return
+        _, _, color, lw, alpha = self._boundary_segment_draw_style()
+        # 用 ax.plot 逐条绘制，避免 LineCollection 单色/裁剪导致边界段不可见
+        for i in idx:
+            x0, y0 = float(xm[i, 0]), float(xm[i, 1])
+            x1, y1 = float(xp[i, 0]), float(xp[i, 1])
+            if not (np.isfinite([x0, y0, x1, y1]).all()):
+                continue
+            ax.plot(
+                [x0, x1],
+                [y0, y1],
+                color=color,
+                linewidth=lw,
+                alpha=alpha,
+                zorder=6,
+                solid_capstyle="round",
+            )
+
+    def _log_segment_export_stats(
+        self, cnt: int, n_seg: int, idx_int, idx_bnd, xm, xp
+    ):
+        if not bool(
+            self.seg_cfg.get_cfg("boundaryInjectionLog", False)
+            or self.seg_cfg.get_cfg("imageExportSegmentDebug", False)
+        ):
+            return
+        if n_seg <= 0:
+            print(f"[export segments] frame {cnt:04d}: segment_num=0")
+            return
+        st = self.ss_seg.seg_type.to_numpy()[:n_seg]
+        act = self.ss_seg.active.to_numpy()[:n_seg]
+        btype = int(self.seg_cfg.get_cfg("boundarySegmentTypeId", 2))
+        msg = (
+            f"[export segments] frame {cnt:04d}: n_seg={n_seg} active={int(np.sum(act == 1))} "
+            f"draw_interior={idx_int.size} draw_boundary={idx_bnd.size} "
+            f"type_counts={{0:{int(np.sum(st == 0))}, {btype}:{int(np.sum(st == btype))}}}"
+        )
+        if idx_bnd.size > 0:
+            ii = idx_bnd
+            c = 0.5 * (xm[ii] + xp[ii])
+            Ls = np.linalg.norm(xp[ii] - xm[ii], axis=1)
+            msg += (
+                f" | bbox x=[{float(c[:, 0].min()):.3f},{float(c[:, 0].max()):.3f}]"
+                f" y=[{float(c[:, 1].min()):.3f},{float(c[:, 1].max()):.3f}]"
+                f" |L|_med={float(np.median(Ls)):.4f}"
+            )
+        print(msg)
+
+    def _add_interior_segments_3d(self, ax, xm, xp, idx, scalars, vnorm):
+        if idx.size == 0:
+            return
+        seg_xyz = np.stack([xm[idx], xp[idx]], axis=1)
+        lc = Line3DCollection(
+            list(seg_xyz),
+            array=scalars.astype(np.float64),
+            cmap=self._segment_cmap,
+            norm=vnorm,
+            linewidths=self._export_seg_line_width,
+            alpha=0.92,
+        )
+        ax.add_collection3d(lc)
+
+    def _add_boundary_segments_3d(self, ax, xm, xp, idx):
+        if idx.size == 0:
+            return
+        _, _, color, lw, alpha = self._boundary_segment_draw_style()
+        seg_xyz = [np.asarray(s, dtype=np.float64) for s in np.stack([xm[idx], xp[idx]], axis=1)]
+        rgba = to_rgba(color, alpha)
+        lc = Line3DCollection(
+            seg_xyz,
+            colors=[rgba] * len(seg_xyz),
+            linewidths=lw,
+        )
+        ax.add_collection3d(lc)
 
     def export_png(self, cnt, image_path):
         """SPH 与涡段分目录导出；涡段颜色 = 段心处与粒子相同的 m_V*W 加权 vorticity_vis.z。"""
@@ -479,22 +675,13 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             if n_seg > 0:
                 xm = self.ss_seg.x_minus.to_numpy()[:n_seg]
                 xp = self.ss_seg.x_plus.to_numpy()[:n_seg]
-                act = self.ss_seg.active.to_numpy()[:n_seg]
-                idx = np.nonzero(act == 1)[0]
-                if idx.shape[0] > 0:
-                    seg_xyz = np.stack([xm[idx], xp[idx]], axis=1)
-                    scalars = self._seg_vis_scalar.to_numpy()[:n_seg][idx].astype(
+                idx_int, idx_bnd = self._active_segment_index_groups(n_seg)
+                if idx_int.size > 0:
+                    scalars = self._seg_vis_scalar.to_numpy()[:n_seg][idx_int].astype(
                         np.float64
                     )
-                    lc = Line3DCollection(
-                        list(seg_xyz),
-                        array=scalars,
-                        cmap=self._segment_cmap,
-                        norm=vnorm,
-                        linewidths=self._export_seg_line_width,
-                        alpha=0.92,
-                    )
-                    ax2.add_collection3d(lc)
+                    self._add_interior_segments_3d(ax2, xm, xp, idx_int, scalars, vnorm)
+                self._add_boundary_segments_3d(ax2, xm, xp, idx_bnd)
             ax2.set_xlim(0, 4)
             ax2.set_ylim(0, 1)
             ax2.set_zlim(0, 1)
@@ -579,38 +766,89 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             self._compute_segment_center_vort_vis_z(int(self.ps.material_fluid))
             n_seg = int(self.ss_seg.segment_num[None])
             fig2, ax2 = plt.subplots(figsize=(10, 2.5), dpi=200)
-            if self._segment_panel_include_solid and solid_x.shape[0] > 0:
+            pad = float(self.seg_cfg.get_cfg("imageSegmentAxisPad", 0.02))
+            hide_solid = bool(self.seg_cfg.get_cfg("imageSegmentPanelHideSolid", False))
+            draw_solid = (
+                self._segment_panel_include_solid
+                and solid_x.shape[0] > 0
+                and not hide_solid
+            )
+            seg_only_bg = bool(self.seg_cfg.get_cfg("imageSegmentPanelOpaqueBackground", False))
+            if seg_only_bg and hide_solid:
+                bg = self.seg_cfg.get_cfg("imageSegmentPanelBackgroundColor", [255, 255, 255])
+                if bg is None:
+                    bg = [255, 255, 255]
+                bg_arr = np.asarray(bg, dtype=np.float64).ravel()
+                if bg_arr.size >= 3 and float(np.max(bg_arr)) > 1.0:
+                    bg_arr = bg_arr[:3] / 255.0
+                else:
+                    bg_arr = bg_arr[:3] if bg_arr.size >= 3 else np.array([1.0, 1.0, 1.0])
+                fig2.patch.set_facecolor(bg_arr)
+                ax2.set_facecolor(bg_arr)
+            if draw_solid:
                 ax2.scatter(
                     solid_x[:, 0], solid_x[:, 1], color="#00C853",
-                    s=1.0, edgecolors="none",
+                    s=0.6, edgecolors="none", zorder=1, alpha=0.55,
                 )
             if n_seg > 0:
                 xm = self.ss_seg.x_minus.to_numpy()[:n_seg]
                 xp = self.ss_seg.x_plus.to_numpy()[:n_seg]
+                idx_int, idx_bnd = self._active_segment_index_groups(n_seg)
+                btype = int(self.seg_cfg.get_cfg("boundarySegmentTypeId", 2))
+                st = self.ss_seg.seg_type.to_numpy()[:n_seg]
                 act = self.ss_seg.active.to_numpy()[:n_seg]
-                idx = np.nonzero(act == 1)[0]
-                if idx.shape[0] > 0:
-                    scalars = self._seg_vis_scalar.to_numpy()[:n_seg][idx].astype(
+                # 若类型标记异常，仍把全部活跃段按边界色绘制
+                if idx_bnd.size == 0 and int(np.sum(act == 1)) > 0:
+                    idx_all = np.nonzero(act == 1)[0]
+                    if int(np.sum(st[idx_all] == btype)) == 0:
+                        idx_bnd = idx_all
+                    elif int(np.sum(st[idx_all] == btype)) > 0:
+                        idx_bnd = idx_all[st[idx_all] == btype]
+                if idx_int.size > 0:
+                    scalars = self._seg_vis_scalar.to_numpy()[:n_seg][idx_int].astype(
                         np.float64
                     )
-                    segs = np.stack([xm[idx], xp[idx]], axis=1)
-                    lc = LineCollection(
-                        list(segs[:, :, :2]),
-                        array=scalars,
-                        cmap=self._segment_cmap,
-                        norm=vnorm,
-                        linewidths=self._export_seg_line_width,
-                        alpha=0.92,
-                    )
-                    ax2.add_collection(lc)
-            ax2.set_xlim(float(ds[0]), float(de[0]))
-            ax2.set_ylim(float(ds[1]), float(de[1]))
+                    self._add_interior_segments_2d(ax2, xm, xp, idx_int, scalars, vnorm)
+                self._add_boundary_segments_2d(ax2, xm, xp, idx_bnd)
+                self._log_segment_export_stats(cnt, n_seg, idx_int, idx_bnd, xm, xp)
+            fit_seg = bool(
+                self.seg_cfg.get_cfg("imageSegmentPanelFitToSegments", True)
+            )
+            use_sim_domain = bool(
+                self.seg_cfg.get_cfg("imageSegmentPanelUseSimulationDomain", False)
+            )
+            if (
+                n_seg > 0
+                and fit_seg
+                and not use_sim_domain
+            ):
+                draw_idx = idx_bnd if idx_bnd.size > 0 else np.arange(n_seg)
+                if draw_idx.size > 0:
+                    xs = np.concatenate([xm[draw_idx, 0], xp[draw_idx, 0]])
+                    ys = np.concatenate([xm[draw_idx, 1], xp[draw_idx, 1]])
+                    if np.all(np.isfinite(xs)) and np.all(np.isfinite(ys)):
+                        ax2.set_xlim(float(xs.min()) - pad, float(xs.max()) + pad)
+                        ax2.set_ylim(float(ys.min()) - pad, float(ys.max()) + pad)
+                    else:
+                        ax2.set_xlim(float(ds[0]), float(de[0]))
+                        ax2.set_ylim(float(ds[1]), float(de[1]))
+                else:
+                    ax2.set_xlim(float(ds[0]), float(de[0]))
+                    ax2.set_ylim(float(ds[1]), float(de[1]))
+            else:
+                ax2.set_xlim(float(ds[0]), float(de[0]))
+                ax2.set_ylim(float(ds[1]), float(de[1]))
             ax2.set_aspect("equal", adjustable="box")
             ax2.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            seg_transparent = not (seg_only_bg and hide_solid)
             plt.savefig(
                 dir_seg / f"vorticity_{cnt:04}.png",
-                bbox_inches="tight", pad_inches=0, transparent=True, dpi=400,
+                bbox_inches="tight",
+                pad_inches=0.02,
+                transparent=seg_transparent,
+                dpi=400,
+                facecolor=fig2.get_facecolor() if not seg_transparent else "none",
             )
             plt.close("all")
 

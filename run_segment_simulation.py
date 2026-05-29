@@ -37,24 +37,30 @@ def main():
     args = parser.parse_args()
 
     cfg = SegmentConfig(scene_file_path=args.scene_file)
+    print(f"[Segment] loaded scene: {args.scene_file}", flush=True)
     simulation_time = float(cfg.get_cfg("simulationTime", 5.0))
     dt = float(cfg.get_cfg("timeStepSize", 0.002))
     export_interval = int(cfg.get_cfg("exportInterval", 8))
+    print(f"[Segment] simulation_time={simulation_time}, dt={dt}, export_interval={export_interval}", flush=True)
     export_ply = bool(cfg.get_cfg("exportPLY", True))
     export_images = bool(cfg.get_cfg("exportImages", True))
 
-    out_ply = Path("result_segment_ply_Karman3D3")
-    out_img = Path("result_segment_images_Karman3D3")
+    out_ply = Path("result_segment_ply_Karman2D_07")
+    out_img = Path("result_segment_images_Karman2D_07")
     if export_ply:
         clear_dir(out_ply)
     if export_images:
         clear_dir(out_img)
 
     ss = SegmentSystem(cfg)
+    print("[Segment] SegmentSystem created", flush=True)
     solver = SegmentSolver(ss)
+    print("[Segment] SegmentSolver created", flush=True)
     exporter = SegmentExporter(ss)
 
+    print("[Segment] initialize begin", flush=True)
     solver.initialize()
+    print(f"[Segment] initialize done, active_segments~{ss.segment_num[None]}", flush=True)
 
     t = 0.0
     frame = 0

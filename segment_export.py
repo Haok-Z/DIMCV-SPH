@@ -21,6 +21,29 @@ class SegmentExporter:
         return np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
     @staticmethod
+    def _as_vec3_array(arr, dtype=np.float64) -> np.ndarray:
+        """Return an (N,3) array from (N,2)/(N,3) simulation vectors."""
+        a = np.asarray(arr, dtype=dtype)
+        if a.ndim == 1:
+            a = a.reshape(1, -1)
+        if a.shape[1] >= 3:
+            return a[:, :3].astype(dtype, copy=False)
+        out = np.zeros((a.shape[0], 3), dtype=dtype)
+        if a.shape[1] > 0:
+            out[:, : a.shape[1]] = a
+        return out
+
+    @staticmethod
+    def _as_vec3(vec, dtype=np.float32) -> np.ndarray:
+        """Return a length-3 vector from 2D/3D configuration arrays."""
+        a = np.asarray(vec, dtype=dtype).ravel()
+        out = np.zeros((3,), dtype=dtype)
+        m = min(3, int(a.size))
+        if m > 0:
+            out[:m] = a[:m]
+        return out
+
+    @staticmethod
     def _apply_ply_axis_convention(p, convention: str):
         """
         将仿真坐标写到 PLY 顶点。
@@ -320,8 +343,8 @@ class SegmentExporter:
         seg_type = np.zeros((0,), dtype=np.int32)
         has_segments = False
         if n > 0:
-            x_minus = self.ss.x_minus.to_numpy()[:n].astype(np.float64)
-            x_plus = self.ss.x_plus.to_numpy()[:n].astype(np.float64)
+            x_minus = self._as_vec3_array(self.ss.x_minus.to_numpy()[:n], dtype=np.float64)
+            x_plus = self._as_vec3_array(self.ss.x_plus.to_numpy()[:n], dtype=np.float64)
             gamma = self.ss.gamma.to_numpy()[:n].astype(np.float64)
             active = self.ss.active.to_numpy()[:n].astype(bool)
             seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
@@ -337,6 +360,146 @@ class SegmentExporter:
 
         center = 0.5 * (x_minus + x_plus) if x_minus.shape[0] > 0 else np.zeros((0, 3), dtype=np.float64)
         slo, shi = self._solid_scene_bounds(blocks, cyls) if has_solids else (None, None)
+
+        if int(getattr(self.ss, "dim", 3)) == 2:
+            fig, ax = plt.subplots(figsize=(12, 3), dpi=200)
+            bg = self._to_rgb01(
+                self.ss.cfg.get_cfg("imageSegmentPanelBackgroundColor", [20, 20, 30]),
+                [20 / 255.0, 20 / 255.0, 30 / 255.0],
+            )
+            fig.patch.set_facecolor(bg)
+            ax.set_facecolor(bg)
+
+            draw_circle = bool(self.ss.cfg.get_cfg("imageSegmentPanelDrawCircleObstacle", False))
+            if draw_circle:
+                cc = self._as_vec3(
+                    self.ss.cfg.get_cfg("imageSegmentPanelCircleCenter", [0.65, 0.5]),
+                    dtype=np.float64,
+                )
+                cr = float(self.ss.cfg.get_cfg("imageSegmentPanelCircleRadius", 0.1))
+                ccol = self._to_rgb01(
+                    self.ss.cfg.get_cfg("imageSegmentPanelCircleColor", [80, 80, 80]),
+                    [80 / 255.0, 80 / 255.0, 80 / 255.0],
+                )
+                ax.add_patch(plt.Circle((float(cc[0]), float(cc[1])), cr, color=ccol, zorder=1))
+
+            for blk in blocks:
+                start = self._as_vec3(blk.get("start", [0.0, 0.0]), dtype=np.float64)
+                end = self._as_vec3(blk.get("end", [0.0, 0.0]), dtype=np.float64)
+                scale_raw = blk.get("scale", [1.0, 1.0])
+                scale = self._as_vec3(scale_raw, dtype=np.float64)
+                if len(scale_raw) < 3:
+                    scale[2] = 1.0
+                tr = self._as_vec3(blk.get("translation", [0.0, 0.0]), dtype=np.float64)
+                lo = np.minimum(start + tr, start + tr + (end - start) * scale)
+                hi = np.maximum(start + tr, start + tr + (end - start) * scale)
+                bcol = self._to_rgb01(blk.get("color", [80, 80, 80]), [0.31, 0.31, 0.31])
+                ax.add_patch(
+                    plt.Rectangle(
+                        (float(lo[0]), float(lo[1])),
+                        float(hi[0] - lo[0]),
+                        float(hi[1] - lo[1]),
+                        facecolor=bcol,
+                        edgecolor=bcol,
+                        linewidth=0.0,
+                        zorder=1,
+                    )
+                )
+
+            if x_minus.shape[0] > 0:
+                line_width = float(
+                    self.ss.cfg.get_cfg(
+                        "imageSegmentLineWidth",
+                        self.ss.cfg.get_cfg("imageLineWidth", 0.4),
+                    )
+                )
+                line_alpha = float(
+                    self.ss.cfg.get_cfg(
+                        "imageSegmentLineAlpha",
+                        self.ss.cfg.get_cfg("imageLineAlpha", 1.0),
+                    )
+                )
+                draw_underlay = bool(self.ss.cfg.get_cfg("imageSegmentDrawWhiteUnderlay", False))
+                underlay_lw = float(
+                    self.ss.cfg.get_cfg("imageSegmentWhiteUnderlayLineWidth", line_width * 1.5)
+                )
+                underlay_alpha = float(
+                    self.ss.cfg.get_cfg("imageSegmentWhiteUnderlayAlpha", 1.0)
+                )
+                cmap_name = str(self.ss.cfg.get_cfg("imageSegmentColormap", "coolwarm"))
+                cm = plt.get_cmap(cmap_name)
+                vmin_cfg = self.ss.cfg.get_cfg("imageGammaVmin", None)
+                vmax_cfg = self.ss.cfg.get_cfg("imageGammaVmax", None)
+                if vmin_cfg is None:
+                    vmin_cfg = self.ss.cfg.get_cfg("imageVorticityVmin", -1.0)
+                if vmax_cfg is None:
+                    vmax_cfg = self.ss.cfg.get_cfg("imageVorticityVmax", 1.0)
+                vmin = float(vmin_cfg)
+                vmax = float(vmax_cfg)
+                if abs(vmax - vmin) < 1e-8:
+                    vmax = vmin + 1e-8
+                norm = Normalize(vmin=vmin, vmax=vmax)
+                bvmin_cfg = self.ss.cfg.get_cfg("imageBoundaryGammaVmin", vmin)
+                bvmax_cfg = self.ss.cfg.get_cfg("imageBoundaryGammaVmax", vmax)
+                bvmin = float(bvmin_cfg)
+                bvmax = float(bvmax_cfg)
+                if abs(bvmax - bvmin) < 1e-8:
+                    bvmax = bvmin + 1e-8
+                boundary_norm = Normalize(vmin=bvmin, vmax=bvmax)
+
+                boundary_type = int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2))
+                show_boundary = bool(self.ss.cfg.get_cfg("imageShowBoundarySegments", True))
+                boundary_color = self._to_rgb01(
+                    self.ss.cfg.get_cfg("imageBoundarySegmentColor", [255, 200, 50]),
+                    [1.0, 0.78, 0.2],
+                )
+                boundary_lw = float(self.ss.cfg.get_cfg("imageBoundarySegmentLineWidth", line_width))
+                boundary_alpha = float(self.ss.cfg.get_cfg("imageBoundarySegmentAlpha", 1.0))
+                boundary_color_by_gamma = bool(self.ss.cfg.get_cfg("imageBoundarySegmentColorByGamma", False))
+
+                for i in range(x_minus.shape[0]):
+                    st = int(seg_type[i])
+                    is_boundary = show_boundary and st == boundary_type
+                    if draw_underlay and not is_boundary:
+                        ax.plot(
+                            [float(x_minus[i, 0]), float(x_plus[i, 0])],
+                            [float(x_minus[i, 1]), float(x_plus[i, 1])],
+                            color="white",
+                            linewidth=underlay_lw,
+                            alpha=underlay_alpha,
+                            solid_capstyle="round",
+                            zorder=2,
+                        )
+                    if is_boundary:
+                        col = cm(boundary_norm(float(gamma[i]))) if boundary_color_by_gamma else boundary_color
+                        lw_i = boundary_lw
+                        alpha_i = boundary_alpha
+                        zorder_i = 4
+                    else:
+                        col = cm(norm(float(gamma[i])))
+                        lw_i = line_width
+                        alpha_i = line_alpha
+                        zorder_i = 3
+                    ax.plot(
+                        [float(x_minus[i, 0]), float(x_plus[i, 0])],
+                        [float(x_minus[i, 1]), float(x_plus[i, 1])],
+                        color=col,
+                        linewidth=lw_i,
+                        alpha=alpha_i,
+                        solid_capstyle="round",
+                        zorder=zorder_i,
+                    )
+
+            domain_start = self._as_vec3(self.ss.domain_start, dtype=np.float32)
+            domain_end = self._as_vec3(self.ss.domain_end, dtype=np.float32)
+            ax.set_xlim(float(domain_start[0]), float(domain_end[0]))
+            ax.set_ylim(float(domain_start[1]), float(domain_end[1]))
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_axis_off()
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            plt.savefig(path, bbox_inches="tight", pad_inches=0, facecolor=fig.get_facecolor(), dpi=400)
+            plt.close(fig)
+            return
 
         fig = plt.figure(figsize=(10, 4), dpi=200)
         ax = fig.add_subplot(111, projection="3d")
@@ -396,6 +559,13 @@ class SegmentExporter:
         if abs(vmax - vmin) < 1e-8:
             vmax = vmin + 1e-8
         norm = Normalize(vmin=vmin, vmax=vmax)
+        bvmin_cfg = self.ss.cfg.get_cfg("imageBoundaryGammaVmin", vmin)
+        bvmax_cfg = self.ss.cfg.get_cfg("imageBoundaryGammaVmax", vmax)
+        bvmin = float(bvmin_cfg)
+        bvmax = float(bvmax_cfg)
+        if abs(bvmax - bvmin) < 1e-8:
+            bvmax = bvmin + 1e-8
+        boundary_norm = Normalize(vmin=bvmin, vmax=bvmax)
         cmap = "coolwarm"
 
         line_width = float(self.ss.cfg.get_cfg("imageLineWidth", 0.8))
@@ -416,37 +586,64 @@ class SegmentExporter:
             self.ss.cfg.get_cfg("imageOtherSegmentColor", [210, 210, 210]),
             [0.82, 0.82, 0.82],
         )
+        boundary_type = int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2))
+        show_boundary = bool(self.ss.cfg.get_cfg("imageShowBoundarySegments", True))
+        boundary_color = self._to_rgb01(
+            self.ss.cfg.get_cfg("imageBoundarySegmentColor", [255, 165, 0]),
+            [1.0, 0.65, 0.0],
+        )
+        bnd_lw_cfg = self.ss.cfg.get_cfg("imageBoundarySegmentLineWidth", None)
+        boundary_lw = (
+            float(bnd_lw_cfg)
+            if bnd_lw_cfg is not None
+            else line_width * 1.35
+        )
+        boundary_alpha = float(self.ss.cfg.get_cfg("imageBoundarySegmentAlpha", 0.95))
+        boundary_color_by_gamma = bool(self.ss.cfg.get_cfg("imageBoundarySegmentColorByGamma", False))
         for i in range(x_minus.shape[0]):
-            if use_type_colors:
-                st = int(seg_type[i])
+            st = int(seg_type[i])
+            if show_boundary and st == boundary_type:
+                col = cm(boundary_norm(float(gamma[i]))) if boundary_color_by_gamma else boundary_color
+                lw_i = boundary_lw
+                alpha_i = boundary_alpha
+            elif use_type_colors:
                 if st == ring1_type:
                     col = ring1_color
                 elif st == ring2_type:
                     col = ring2_color
                 else:
                     col = other_color
+                lw_i = line_width
+                alpha_i = line_alpha
             else:
                 col = cm(norm(float(gamma[i])))
+                lw_i = line_width
+                alpha_i = line_alpha
             ax.plot(
                 [float(x_minus[i, 0]), float(x_plus[i, 0])],
                 [float(x_minus[i, 1]), float(x_plus[i, 1])],
                 [float(x_minus[i, 2]), float(x_plus[i, 2])],
                 color=col,
-                linewidth=line_width,
-                alpha=line_alpha,
+                linewidth=lw_i,
+                alpha=alpha_i,
+                zorder=3 if show_boundary and st == boundary_type else 2,
             )
 
         if center.shape[0] > 0:
-            if use_type_colors:
+            if use_type_colors or show_boundary:
                 point_colors = np.zeros((center.shape[0], 3), dtype=np.float32)
                 for i in range(center.shape[0]):
                     st = int(seg_type[i])
-                    if st == ring1_type:
+                    if show_boundary and st == boundary_type:
+                        point_colors[i] = boundary_color
+                    elif use_type_colors and st == ring1_type:
                         point_colors[i] = ring1_color
-                    elif st == ring2_type:
+                    elif use_type_colors and st == ring2_type:
                         point_colors[i] = ring2_color
-                    else:
+                    elif use_type_colors:
                         point_colors[i] = other_color
+                    else:
+                        point_colors[i] = cm(norm(float(gamma[i])))[:3]
                 ax.scatter(
                     center[:, 0],
                     center[:, 1],
@@ -471,8 +668,8 @@ class SegmentExporter:
                 if bool(self.ss.cfg.get_cfg("imageShowColorbar", False)):
                     fig.colorbar(sc, ax=ax, fraction=0.02, pad=0.01)
 
-        domain_start = self.ss.domain_start.astype(np.float32)
-        domain_end = self.ss.domain_end.astype(np.float32)
+        domain_start = self._as_vec3(self.ss.domain_start, dtype=np.float32)
+        domain_end = self._as_vec3(self.ss.domain_end, dtype=np.float32)
         span = np.maximum(domain_end - domain_start, 1e-6)
 
         follow = bool(self.ss.cfg.get_cfg("imageFollowSegments", False))

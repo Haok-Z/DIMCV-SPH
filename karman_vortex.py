@@ -299,6 +299,8 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             self.ps.rebuild_neighbor_grid()
         self.cnt += 1
         self.compute_moving_boundary_volume()
+        if int(self.ps.fluid_particle_num[None]) <= 0:
+            return
         self.substep()
 
         if self.ps.cfg.get_cfg("bounceBackBoundary"):

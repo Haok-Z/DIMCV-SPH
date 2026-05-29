@@ -30,6 +30,9 @@ class SegmentSystem:
         self.center = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
         self.tangent = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
         self.length = ti.field(dtype=float, shape=self.segment_max_num)
+        # 固定段心/段长对流时，在初始化末快照的参考几何
+        self.center_ref = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
+        self.length_ref = ti.field(dtype=float, shape=self.segment_max_num)
 
     @ti.kernel
     def clear(self):
