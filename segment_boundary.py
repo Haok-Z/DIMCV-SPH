@@ -97,6 +97,17 @@ class SegmentBoundaryHandler:
         self._u_d = None  # (Nb,3) float32，用于调试：内部段诱导速度
         self._last_boundary_commit_count = 0
 
+        self._gpu_boundary_cap_nb = max(1, int(self.nb))
+        self._gpu_boundary_cap_ng = max(1, int(self.ng if self.ng > 0 else self.nb))
+        self._gpu_boundary_b = ti.Vector.field(3, dtype=ti.f32, shape=self._gpu_boundary_cap_nb)
+        self._gpu_boundary_ub = ti.Vector.field(3, dtype=ti.f32, shape=self._gpu_boundary_cap_nb)
+        self._gpu_boundary_ud = ti.Vector.field(3, dtype=ti.f32, shape=self._gpu_boundary_cap_nb)
+        self._gpu_boundary_U = ti.field(dtype=ti.f32, shape=3 * self._gpu_boundary_cap_nb)
+        self._gpu_boundary_P = ti.field(dtype=ti.f32, shape=(self._gpu_boundary_cap_ng, 3 * self._gpu_boundary_cap_nb))
+        self._gpu_boundary_gamma = ti.field(dtype=ti.f32, shape=self._gpu_boundary_cap_ng)
+        self._gpu_boundary_projection_ready = False
+        self._gpu_boundary_samples_synced = False
+
         self._use_2d_point_bs = _cfg_use_2d_point_vortex_bs(self.ss.cfg, int(self.ss.dim))
 
     def set_particle_system(self, particle_system):
@@ -1275,6 +1286,108 @@ class SegmentBoundaryHandler:
         self._K = K
         self._K_nb = nb
         self._K_ng = ng
+
+    def _gpu_boundary_enabled(self) -> bool:
+        return bool(self.ss.cfg.get_cfg("enableGpuBoundarySolve", False)) and self._use_2d_point_bs and int(self.ss.dim) == 2
+
+    def _prepare_gpu_boundary_projection(self) -> bool:
+        if not self._gpu_boundary_enabled():
+            return False
+        if self._K is None or self._b_points is None or self._b_vel is None:
+            return False
+        nb = int(self._K_nb)
+        ng = int(self._K_ng)
+        if nb <= 0 or ng <= 0:
+            return False
+        if nb > self._gpu_boundary_cap_nb or ng > self._gpu_boundary_cap_ng:
+            return False
+        if self._gpu_boundary_projection_ready and self._gpu_boundary_samples_synced:
+            return True
+
+        K = self._K.astype(np.float64, copy=False)
+        eps = max(float(self.ss.cfg.get_cfg("boundaryLeastSquaresEps", 1e-4)), 0.0)
+        A = K.T @ K
+        if eps > 0.0:
+            A = A + eps * np.eye(ng, dtype=np.float64)
+        try:
+            P = np.linalg.solve(A, K.T).astype(np.float32)
+        except np.linalg.LinAlgError:
+            P = np.linalg.lstsq(A, K.T, rcond=None)[0].astype(np.float32)
+
+        p_host = np.zeros((self._gpu_boundary_cap_ng, 3 * self._gpu_boundary_cap_nb), dtype=np.float32)
+        p_host[:ng, : 3 * nb] = P
+        self._gpu_boundary_P.from_numpy(p_host)
+
+        b_host = np.zeros((self._gpu_boundary_cap_nb, 3), dtype=np.float32)
+        ub_host = np.zeros((self._gpu_boundary_cap_nb, 3), dtype=np.float32)
+        b_host[:nb] = self._b_points[:nb].astype(np.float32, copy=False)
+        ub_host[:nb] = self._b_vel[:nb].astype(np.float32, copy=False)
+        self._gpu_boundary_b.from_numpy(b_host)
+        self._gpu_boundary_ub.from_numpy(ub_host)
+
+        self._gpu_boundary_projection_ready = True
+        self._gpu_boundary_samples_synced = True
+        return True
+
+    @ti.kernel
+    def _compute_rhs_2d_point_gpu_kernel(
+        self,
+        nb: int,
+        ns: int,
+        boundary_type: int,
+        reg_radius: float,
+        ux: float,
+        uy: float,
+        uz: float,
+    ):
+        R2 = reg_radius * reg_radius
+        for i in range(nb):
+            b = self._gpu_boundary_b[i]
+            ud = ti.Vector([0.0, 0.0, 0.0])
+            for j in range(ns):
+                if self.ss.active[j] == 1 and self.ss.seg_type[j] != boundary_type:
+                    am = self.ss.x_minus[j]
+                    ap = self.ss.x_plus[j]
+                    c = 0.5 * (am + ap)
+                    L = (ap - am).norm() + 1e-8
+                    Gamma = self.ss.gamma[j] * L
+                    r = ti.Vector([b[0] - c[0], b[1] - c[1], 0.0])
+                    r2 = r[0] * r[0] + r[1] * r[1] + R2
+                    denom = r2 + 1e-12
+                    coeff = Gamma / (2.0 * ti.math.pi * denom)
+                    ud[0] += -r[1] * coeff
+                    ud[1] += r[0] * coeff
+            self._gpu_boundary_ud[i] = ud
+            uinf = ti.Vector([ux, uy, uz])
+            U = self._gpu_boundary_ub[i] - ud - uinf
+            self._gpu_boundary_U[3 * i + 0] = U[0]
+            self._gpu_boundary_U[3 * i + 1] = U[1]
+            self._gpu_boundary_U[3 * i + 2] = U[2]
+
+    @ti.kernel
+    def _solve_gamma_projection_gpu_kernel(self, nb: int, ng: int):
+        for a in range(ng):
+            acc = 0.0
+            for r in range(3 * nb):
+                acc += self._gpu_boundary_P[a, r] * self._gpu_boundary_U[r]
+            self._gpu_boundary_gamma[a] = acc
+
+    def _compute_rhs_and_solve_gpu(self) -> bool:
+        if not self._prepare_gpu_boundary_projection():
+            return False
+        nb = int(self._K_nb)
+        ng = int(self._K_ng)
+        ns = int(self.ss.segment_num[None])
+        boundary_type = int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2))
+        reg_radius = float(self.ss.cfg.get_cfg("regularizationRadiusR", 0.01))
+        u_inf = self._get_background_velocity().astype(np.float32, copy=False)
+        self._compute_rhs_2d_point_gpu_kernel(nb, ns, boundary_type, reg_radius, float(u_inf[0]), float(u_inf[1]), float(u_inf[2]))
+        self._solve_gamma_projection_gpu_kernel(nb, ng)
+        gamma = self._gpu_boundary_gamma.to_numpy()[:ng].astype(np.float32, copy=False)
+        if self._g_gamma is None or self._g_gamma.shape[0] != ng:
+            self._g_gamma = np.zeros((ng,), dtype=np.float32)
+        self._g_gamma[:ng] = gamma
+        return True
 
     def compute_rhs(self):
         """

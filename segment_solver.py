@@ -134,6 +134,13 @@ class SegmentSolver:
         self.k3_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
         self.k4_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
 
+        self._compact_x_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self._compact_x_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self._compact_gamma = ti.field(dtype=float, shape=self.ss.segment_max_num)
+        self._compact_age = ti.field(dtype=float, shape=self.ss.segment_max_num)
+        self._compact_seg_type = ti.field(dtype=int, shape=self.ss.segment_max_num)
+        self._compact_counter = ti.field(dtype=ti.i32, shape=())
+
         self._fz_a = ti.field(dtype=ti.i32, shape=())
         self._fz_b = ti.field(dtype=ti.i32, shape=())
         self._fz_c = ti.field(dtype=ti.i32, shape=())
@@ -404,9 +411,11 @@ class SegmentSolver:
             self.boundary.release_vorticity_to_internal_segments()
         else:
             self.boundary.generate_boundary_segments()
-            self.boundary.compute_k_matrix()
-            self.boundary.compute_rhs()
-            self.boundary.solve_linear_system()
+            if (not bool(self.ss.cfg.get_cfg("boundaryProjectionCache", True))) or self.boundary._K is None:
+                self.boundary.compute_k_matrix()
+            if not self.boundary._compute_rhs_and_solve_gpu():
+                self.boundary.compute_rhs()
+                self.boundary.solve_linear_system()
             self.boundary.commit_boundary_segments()
             self.boundary.release_vorticity_to_internal_segments()
         self.ss.update_segment_geometry()
@@ -1727,7 +1736,126 @@ class SegmentSolver:
             self.ss.gamma[i] *= self.gamma_decay
             self.ss.age[i] += self.dt
 
-    def delete_weak_segments(self):
+    def _delete_weak_segments_gpu(self, n: int, skip_topo: Set[int]) -> bool:
+        if not bool(self.ss.cfg.get_cfg("enableGpuDeleteCompact", False)):
+            return False
+        if n <= 0:
+            return True
+        sa, sb, sc, sd = self._skip_ids_for_kernel(skip_topo)
+        enable_weak = 1 if bool(self.ss.cfg.get_cfg("enableDeleteWeakSegments", True)) else 0
+        ofx_cfg = self.ss.cfg.get_cfg("outflowDeleteCenterBeyondX", None)
+        has_outflow = 1 if ofx_cfg is not None else 0
+        outflow_x = float(ofx_cfg) if ofx_cfg is not None else 0.0
+        max_age_cfg = self.ss.cfg.get_cfg("deleteMaxAge", None)
+        has_max_age = 1 if max_age_cfg is not None else 0
+        max_age = float(max_age_cfg) if max_age_cfg is not None else 0.0
+        delete_outside = 1 if bool(self.ss.cfg.get_cfg("deleteOutsideDomain", False)) else 0
+        lo = self.ss.domain_start.astype(np.float32)
+        hi = self.ss.domain_end.astype(np.float32)
+        lo2 = float(lo[1]) if self.ss.dim >= 2 else 0.0
+        hi2 = float(hi[1]) if self.ss.dim >= 2 else 0.0
+        lo3 = float(lo[2]) if self.ss.dim >= 3 else 0.0
+        hi3 = float(hi[2]) if self.ss.dim >= 3 else 0.0
+        self._compact_counter[None] = 0
+        self._compact_segments_kernel(
+            n,
+            enable_weak,
+            float(self.delete_gamma_threshold),
+            has_outflow,
+            outflow_x,
+            has_max_age,
+            max_age,
+            delete_outside,
+            float(lo[0]),
+            lo2,
+            lo3,
+            float(hi[0]),
+            hi2,
+            hi3,
+            sa,
+            sb,
+            sc,
+            sd,
+        )
+        self._copy_compacted_segments_kernel(n)
+        return True
+
+    @ti.kernel
+    def _compact_segments_kernel(
+        self,
+        n: int,
+        enable_weak: int,
+        gamma_threshold: float,
+        has_outflow: int,
+        outflow_x: float,
+        has_max_age: int,
+        max_age: float,
+        delete_outside: int,
+        lo0: float,
+        lo1: float,
+        lo2: float,
+        hi0: float,
+        hi1: float,
+        hi2: float,
+        skip_a: int,
+        skip_b: int,
+        skip_c: int,
+        skip_d: int,
+    ):
+        for i in range(n):
+            st = self.ss.seg_type[i]
+            skip = (st == skip_a) or (st == skip_b) or (st == skip_c) or (st == skip_d)
+            keep = self.ss.active[i] == 1
+            if keep and enable_weak == 1 and not skip:
+                keep = ti.abs(self.ss.gamma[i]) >= gamma_threshold
+            if keep and has_outflow == 1 and not skip:
+                mid_x = 0.5 * (self.ss.x_minus[i][0] + self.ss.x_plus[i][0])
+                keep = mid_x <= outflow_x
+            if keep and has_max_age == 1:
+                keep = self.ss.age[i] <= max_age
+            if keep and delete_outside == 1 and not skip:
+                if ti.static(self.ss.dim == 2):
+                    xm = self.ss.x_minus[i]
+                    xp = self.ss.x_plus[i]
+                    keep = (
+                        xm[0] >= lo0 and xm[0] <= hi0 and xm[1] >= lo1 and xm[1] <= hi1 and
+                        xp[0] >= lo0 and xp[0] <= hi0 and xp[1] >= lo1 and xp[1] <= hi1
+                    )
+                else:
+                    xm = self.ss.x_minus[i]
+                    xp = self.ss.x_plus[i]
+                    keep = (
+                        xm[0] >= lo0 and xm[0] <= hi0 and xm[1] >= lo1 and xm[1] <= hi1 and xm[2] >= lo2 and xm[2] <= hi2 and
+                        xp[0] >= lo0 and xp[0] <= hi0 and xp[1] >= lo1 and xp[1] <= hi1 and xp[2] >= lo2 and xp[2] <= hi2
+                    )
+            if keep:
+                j = ti.atomic_add(self._compact_counter[None], 1)
+                self._compact_x_minus[j] = self.ss.x_minus[i]
+                self._compact_x_plus[j] = self.ss.x_plus[i]
+                self._compact_gamma[j] = self.ss.gamma[i]
+                self._compact_age[j] = self.ss.age[i]
+                self._compact_seg_type[j] = self.ss.seg_type[i]
+
+    @ti.kernel
+    def _copy_compacted_segments_kernel(self, n_old: int):
+        n_new = self._compact_counter[None]
+        for i in range(n_old):
+            self.ss.active[i] = 0
+        for i in range(n_new):
+            self.ss.x_minus[i] = self._compact_x_minus[i]
+            self.ss.x_plus[i] = self._compact_x_plus[i]
+            self.ss.gamma[i] = self._compact_gamma[i]
+            self.ss.age[i] = self._compact_age[i]
+            self.ss.seg_type[i] = self._compact_seg_type[i]
+            self.ss.active[i] = 1
+            d = self.ss.x_plus[i] - self.ss.x_minus[i]
+            l = d.norm() + 1e-8
+            self.ss.center[i] = 0.5 * (self.ss.x_minus[i] + self.ss.x_plus[i])
+            self.ss.tangent[i] = d / l
+            self.ss.length[i] = l
+        self.ss.segment_num[None] = n_new
+
+    def _delete_weak_segments_cpu(self):
         """
         删除弱段并压缩段池：
         - 必选条件：|gamma| >= delete_gamma_threshold
@@ -1745,6 +1873,8 @@ class SegmentSolver:
         seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
 
         skip_topo = self._topology_skip_type_ids()
+        if self._delete_weak_segments_gpu(n, skip_topo):
+            return
         keep = active == 1
         if bool(self.ss.cfg.get_cfg("enableDeleteWeakSegments", True)):
             keep &= np.abs(gamma) >= float(self.delete_gamma_threshold)
@@ -1803,6 +1933,15 @@ class SegmentSolver:
     def _clear_active_kernel(self, n_old: int):
         for i in range(n_old):
             self.ss.active[i] = 0
+
+    def delete_weak_segments(self):
+        n = int(self.ss.segment_num[None])
+        if n <= 0:
+            return
+        skip_topo = self._topology_skip_type_ids()
+        if self._delete_weak_segments_gpu(n, skip_topo):
+            return
+        self._delete_weak_segments_cpu()
 
     def split_segments(self):
         """
@@ -2345,8 +2484,27 @@ class SegmentSolver:
         )
         self.ss.segment_num[None] = offset + n_new
 
+    def _emitter_burst_active(self) -> bool:
+        if not bool(self.ss.cfg.get_cfg("emitterBurstEnabled", False)):
+            return True
+        on_steps = int(self.ss.cfg.get_cfg("emitterBurstOnSteps", 1))
+        off_steps = int(self.ss.cfg.get_cfg("emitterBurstOffSteps", 0))
+        start_step = int(self.ss.cfg.get_cfg("emitterBurstStartStep", 0))
+        on_steps = max(0, on_steps)
+        off_steps = max(0, off_steps)
+        local_step = int(self._sim_step_index) - start_step
+        if local_step < 0:
+            return False
+        cycle = on_steps + off_steps
+        if cycle <= 0:
+            return False
+        phase = local_step % cycle
+        return phase < on_steps
+
     def _emit_inlet_segments(self):
         if not bool(self.ss.cfg.get_cfg("emitterEnabled", False)):
+            return
+        if not self._emitter_burst_active():
             return
         stride = max(1, int(self.ss.cfg.get_cfg("emitterIntervalStride", 1)))
         if self._emitter_interval_override is not None:

@@ -14,7 +14,7 @@ from segment_export import SegmentExporter
 
 ti.init(
     arch=ti.cuda,
-    device_memory_fraction=0.5,
+    device_memory_GB=10,
     debug=False,
     random_seed=int(time.time()),
     kernel_profiler=False,
