@@ -47,6 +47,12 @@ class SegmentBoundaryHandler:
 
         # 缓存 rigid blocks 以及（可选）动态平移信息
         self._rigid_blocks = self.ss.cfg.get_obstacles() if hasattr(self.ss.cfg, "get_obstacles") else []
+        exclude_rigid_ids = set(int(x) for x in (self.ss.cfg.get_cfg("boundaryRigidBlockExcludeObjectIds", []) or []))
+        if len(exclude_rigid_ids) > 0:
+            self._rigid_blocks = [
+                blk for blk in self._rigid_blocks
+                if int(blk.get("objectId", -999999)) not in exclude_rigid_ids
+            ]
         self._num_aabb_obstacles = int(len(self._rigid_blocks))
         self._block_dynamic = []
         self._block_vel = []

@@ -1,5 +1,6 @@
 import taichi as ti
 import numpy as np
+import time
 from typing import List, Set, Tuple
 
 from segment_boundary import SegmentBoundaryHandler
@@ -113,6 +114,9 @@ class SegmentSolver:
             self._boundary_schedule = "each_step"
         self._boundary_one_shot_done = False
         self._sim_step_index = 0
+        self._step_timing_enabled = bool(self.ss.cfg.get_cfg("debugStepTiming", False))
+        self._step_timing_interval = max(1, int(self.ss.cfg.get_cfg("debugStepTimingInterval", 1)))
+        self._step_timing_sync = bool(self.ss.cfg.get_cfg("debugStepTimingSync", True))
         self._emitter_interval_override = None
         self._emitter_slot_cursor = 0
         self._emitter_rng = np.random.default_rng(
@@ -140,6 +144,10 @@ class SegmentSolver:
         self._compact_age = ti.field(dtype=float, shape=self.ss.segment_max_num)
         self._compact_seg_type = ti.field(dtype=int, shape=self.ss.segment_max_num)
         self._compact_counter = ti.field(dtype=ti.i32, shape=())
+
+        self.sph_advect_velocity = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.sph_advect_velocity_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.sph_advect_velocity_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
 
         self._fz_a = ti.field(dtype=ti.i32, shape=())
         self._fz_b = ti.field(dtype=ti.i32, shape=())
@@ -320,8 +328,11 @@ class SegmentSolver:
                 continue
             xm = self.ss.x_minus[i]
             xp = self.ss.x_plus[i]
+            d = xp - xm
+            l = d.norm() + 1e-8
             self.ss.center_ref[i] = 0.5 * (xm + xp)
-            self.ss.length_ref[i] = (xp - xm).norm() + 1e-8
+            self.ss.tangent_ref[i] = d / l
+            self.ss.length_ref[i] = l
 
     @ti.kernel
     def _project_endpoints_fixed_ref_geometry(self):
@@ -333,7 +344,7 @@ class SegmentSolver:
                 continue
             C = self.ss.center_ref[i]
             L = self.ss.length_ref[i]
-            d = self.ss.x_plus[i] - self.ss.x_minus[i]
+            d = self.ss.tangent_ref[i]
             dn = d.norm()
             if dn < 1e-8:
                 continue
@@ -352,8 +363,11 @@ class SegmentSolver:
                 continue
             xm = self.ss.x_minus[i]
             xp = self.ss.x_plus[i]
+            d = xp - xm
+            l = d.norm() + 1e-8
             self.ss.center_ref[i] = 0.5 * (xm + xp)
-            self.ss.length_ref[i] = (xp - xm).norm() + 1e-8
+            self.ss.tangent_ref[i] = d / l
+            self.ss.length_ref[i] = l
 
     @ti.kernel
     def _restore_frozen_segment_geometry(self):
@@ -365,7 +379,7 @@ class SegmentSolver:
                 continue
             C = self.ss.center_ref[i]
             L = self.ss.length_ref[i]
-            d = self.ss.x_plus[i] - self.ss.x_minus[i]
+            d = self.ss.tangent_ref[i]
             dn = d.norm()
             if dn < 1e-8:
                 if ti.static(self.ss.dim == 2):
@@ -1235,8 +1249,8 @@ class SegmentSolver:
 
             xmi = self.ss.x_minus[i]
             xpi = self.ss.x_plus[i]
-            ui_m = self._segment_background(i)
-            ui_p = self._segment_background(i)
+            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
+            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
 
             for j in range(n):
                 if j == i or self.ss.active[j] != 1:
@@ -1280,8 +1294,8 @@ class SegmentSolver:
 
             xmi = self.ss.x_minus[i]
             xpi = self.ss.x_plus[i]
-            ui_m = self._segment_background(i)
-            ui_p = self._segment_background(i)
+            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
+            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
 
             for j in range(n):
                 if j == i or self.ss.active[j] != 1:
@@ -1325,8 +1339,8 @@ class SegmentSolver:
 
             xmi = self.ss.x_minus[i]
             xpi = self.ss.x_plus[i]
-            ui_m = self._segment_background(i)
-            ui_p = self._segment_background(i)
+            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
+            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
 
             for j in range(n):
                 if j == i or self.ss.active[j] != 1:
@@ -1586,8 +1600,8 @@ class SegmentSolver:
             xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
             xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
 
-            ui_m = self._segment_background(i)
-            ui_p = self._segment_background(i)
+            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
+            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
 
             for j in range(n):
                 if j == i or self.ss.active[j] != 1:
@@ -1632,8 +1646,8 @@ class SegmentSolver:
             xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
             xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
 
-            ui_m = self._segment_background(i)
-            ui_p = self._segment_background(i)
+            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
+            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
 
             for j in range(n):
                 if j == i or self.ss.active[j] != 1:
@@ -1679,8 +1693,8 @@ class SegmentSolver:
             xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
             xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
 
-            ui_m = self._segment_background(i)
-            ui_p = self._segment_background(i)
+            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
+            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
 
             for j in range(n):
                 if j == i or self.ss.active[j] != 1:
@@ -1848,7 +1862,7 @@ class SegmentSolver:
             self.ss.age[i] = self._compact_age[i]
             self.ss.seg_type[i] = self._compact_seg_type[i]
             self.ss.active[i] = 1
-            d = self.ss.x_plus[i] - self.ss.x_minus[i]
+            d = self.ss.tangent_ref[i]
             l = d.norm() + 1e-8
             self.ss.center[i] = 0.5 * (self.ss.x_minus[i] + self.ss.x_plus[i])
             self.ss.tangent[i] = d / l
@@ -2184,6 +2198,182 @@ class SegmentSolver:
             self.ss.seg_type[i] = seg_type[i]
             self.ss.active[i] = 1
 
+    def _merge_candidate_indices_from_grid(self, grid, cell, radius: int, dim: int):
+        if dim == 2:
+            cx, cy = cell
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    yield from grid.get((cx + dx, cy + dy), ())
+            return
+        cx, cy, cz = cell
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    yield from grid.get((cx + dx, cy + dy, cz + dz), ())
+
+    def merge_segments(self):
+        if not bool(self.ss.cfg.get_cfg("enableMergeSegments", True)):
+            return
+        interval = max(1, int(self.ss.cfg.get_cfg("mergeIntervalSteps", 1)))
+        if interval > 1 and int(self._sim_step_index) % interval != 0:
+            return
+        n = int(self.ss.segment_num[None])
+        if n <= 1:
+            return
+
+        merge_dist = float(self.ss.cfg.get_cfg("mergeDistanceLambda", 0.03))
+        if merge_dist <= 0.0:
+            return
+        merge_angle = float(self.ss.cfg.get_cfg("mergeAngleThreshold", 5.0 * np.pi / 6.0))
+        dot_th = float(np.cos(merge_angle))
+        skip_merge_types = self._topology_skip_type_ids()
+        require_same_type = bool(self.ss.cfg.get_cfg("mergeRequireSameSegmentType", False))
+
+        x_minus = self.ss.x_minus.to_numpy()[:n].astype(np.float32)
+        x_plus = self.ss.x_plus.to_numpy()[:n].astype(np.float32)
+        gamma = self.ss.gamma.to_numpy()[:n].astype(np.float32)
+        active = self.ss.active.to_numpy()[:n].astype(np.int32)
+        age = self.ss.age.to_numpy()[:n].astype(np.float32)
+        seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
+        center = self.ss.center.to_numpy()[:n].astype(np.float32)
+        tangent = self.ss.tangent.to_numpy()[:n].astype(np.float32)
+
+        d = int(self.ss.dim)
+        use_hash = bool(self.ss.cfg.get_cfg("mergeSpatialHashEnabled", True))
+        cell_size = max(float(self.ss.cfg.get_cfg("mergeSpatialHashCellSize", merge_dist)), 1e-8)
+        inv_cell = 1.0 / cell_size
+        neighbor_radius = max(1, int(np.ceil(merge_dist / cell_size)))
+
+        grid = {}
+        if use_hash:
+            for i in range(n):
+                if active[i] != 1:
+                    continue
+                if d == 2:
+                    cell = (
+                        int(np.floor(float(center[i, 0]) * inv_cell)),
+                        int(np.floor(float(center[i, 1]) * inv_cell)),
+                    )
+                else:
+                    cell = (
+                        int(np.floor(float(center[i, 0]) * inv_cell)),
+                        int(np.floor(float(center[i, 1]) * inv_cell)),
+                        int(np.floor(float(center[i, 2]) * inv_cell)),
+                    )
+                grid.setdefault(cell, []).append(i)
+
+        used = np.zeros((n,), dtype=bool)
+        out_xm = []
+        out_xp = []
+        out_g = []
+        out_a = []
+        out_t = []
+        merge_dist2 = merge_dist * merge_dist
+
+        for i in range(n):
+            if active[i] != 1 or used[i]:
+                continue
+            if int(seg_type[i]) in skip_merge_types:
+                used[i] = True
+                out_xm.append(x_minus[i])
+                out_xp.append(x_plus[i])
+                out_g.append(gamma[i])
+                out_a.append(age[i])
+                out_t.append(seg_type[i])
+                continue
+
+            best_j = -1
+            best_d2 = 1e30
+            ci = center[i]
+            ti = tangent[i]
+            if use_hash:
+                if d == 2:
+                    cell_i = (
+                        int(np.floor(float(ci[0]) * inv_cell)),
+                        int(np.floor(float(ci[1]) * inv_cell)),
+                    )
+                else:
+                    cell_i = (
+                        int(np.floor(float(ci[0]) * inv_cell)),
+                        int(np.floor(float(ci[1]) * inv_cell)),
+                        int(np.floor(float(ci[2]) * inv_cell)),
+                    )
+                candidates = self._merge_candidate_indices_from_grid(grid, cell_i, neighbor_radius, d)
+            else:
+                candidates = range(i + 1, n)
+
+            for j in candidates:
+                if j <= i:
+                    continue
+                if active[j] != 1 or used[j]:
+                    continue
+                if int(seg_type[j]) in skip_merge_types:
+                    continue
+                if require_same_type and int(seg_type[i]) != int(seg_type[j]):
+                    continue
+                dc = ci[:d] - center[j, :d]
+                d2 = float(np.dot(dc, dc))
+                if d2 > merge_dist2:
+                    continue
+                dotv = float(np.dot(ti[:d], tangent[j, :d]))
+                if dotv > dot_th:
+                    continue
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_j = int(j)
+
+            if best_j < 0:
+                used[i] = True
+                out_xm.append(x_minus[i])
+                out_xp.append(x_plus[i])
+                out_g.append(gamma[i])
+                out_a.append(age[i])
+                out_t.append(seg_type[i])
+                continue
+
+            j = best_j
+            used[i] = True
+            used[j] = True
+            di = x_plus[i] - x_minus[i]
+            dj = x_plus[j] - x_minus[j]
+            Li = float(np.linalg.norm(di) + 1e-8)
+            Lj = float(np.linalg.norm(dj) + 1e-8)
+            wi = gamma[i] * di
+            wj = gamma[j] * dj
+            w = wi + wj
+
+            c_new = 0.5 * (center[i] + center[j])
+            L_new = 0.5 * (Li + Lj)
+            w_norm = float(np.linalg.norm(w))
+            if w_norm < 1e-8:
+                continue
+
+            t_new = (w / (w_norm + 1e-8)).astype(np.float32)
+            xm_new = c_new - 0.5 * L_new * t_new
+            xp_new = c_new + 0.5 * L_new * t_new
+            g_new = w_norm / (L_new + 1e-8)
+
+            out_xm.append(xm_new)
+            out_xp.append(xp_new)
+            out_g.append(np.float32(g_new))
+            out_a.append(np.float32(min(age[i], age[j])))
+            out_t.append(seg_type[i])
+
+        new_n = len(out_xm)
+        if new_n <= 0:
+            self.ss.segment_num[None] = 0
+            return
+
+        self._overwrite_segments_kernel(
+            new_n,
+            np.asarray(out_xm, dtype=np.float32),
+            np.asarray(out_xp, dtype=np.float32),
+            np.asarray(out_g, dtype=np.float32),
+            np.asarray(out_a, dtype=np.float32),
+            np.asarray(out_t, dtype=np.int32),
+        )
+        self.ss.segment_num[None] = new_n
+
     def cull_segments(self):
         """
         TODO：
@@ -2501,6 +2691,23 @@ class SegmentSolver:
         phase = local_step % cycle
         return phase < on_steps
 
+    def _emit_periodic_parallel_x_layers(self):
+        if not bool(self.ss.cfg.get_cfg("parallelXRepeatEnabled", False)):
+            return
+        interval = max(1, int(self.ss.cfg.get_cfg("parallelXRepeatIntervalSteps", 100)))
+        start_step = int(self.ss.cfg.get_cfg("parallelXRepeatStartStep", interval))
+        step = int(self._sim_step_index)
+        if step < start_step:
+            return
+        if (step - start_step) % interval != 0:
+            return
+        max_batches = int(self.ss.cfg.get_cfg("parallelXRepeatMaxBatches", 0) or 0)
+        if max_batches > 0:
+            batch_idx = (step - start_step) // interval
+            if batch_idx >= max_batches:
+                return
+        self._seed_parallel_x_layers_filaments()
+
     def _emit_inlet_segments(self):
         if not bool(self.ss.cfg.get_cfg("emitterEnabled", False)):
             return
@@ -2528,6 +2735,30 @@ class SegmentSolver:
         else:
             self._emit_inlet_segments_spanwise_z(x_emit, y0, y1, z0, z1)
 
+    def _step_timing_should_print(self) -> bool:
+        return self._step_timing_enabled and (int(self._sim_step_index) % self._step_timing_interval == 0)
+
+    def _step_timing_mark(self, marks, name: str):
+        if not self._step_timing_enabled:
+            return
+        if self._step_timing_sync:
+            ti.sync()
+        marks.append((name, time.perf_counter()))
+
+    def _step_timing_report(self, marks, active_before: int, active_after: int):
+        if not self._step_timing_should_print() or len(marks) < 2:
+            return
+        total = (marks[-1][1] - marks[0][1]) * 1000.0
+        parts = []
+        for i in range(1, len(marks)):
+            dt_ms = (marks[i][1] - marks[i - 1][1]) * 1000.0
+            parts.append(f"{marks[i][0]}={dt_ms:.3f}ms")
+        print(
+            f"[StepTiming] step={int(self._sim_step_index)} "
+            f"segments={active_before}->{active_after} total={total:.3f}ms | "
+            + ", ".join(parts)
+        )
+
     def step(self):
         """
         独立 Segment 仿真的主步骤模板：
@@ -2548,6 +2779,7 @@ class SegmentSolver:
                 self.boundary.mark_one_shot_complete_if_applicable(self)
 
         self._emit_inlet_segments()
+        self._emit_periodic_parallel_x_layers()
         self.ss.update_segment_geometry()
         self.compute_endpoint_velocity()
         self.advect_segments_rk4()
@@ -2561,3 +2793,48 @@ class SegmentSolver:
             self._decay_impulse_kernel()
         self._sim_step_index += 1
         # self.cull_segments()
+
+    def step(self):
+        """
+        独立 Segment 仿真的主步骤模板，带可选分段计时。
+        """
+        timing_marks = []
+        active_before = int(self.ss.segment_num[None])
+        self._step_timing_mark(timing_marks, "start")
+
+        if self.has_boundary:
+            if self._boundary_schedule == "each_step":
+                strip = bool(self.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False))
+                self._run_boundary_injection_pipeline(strip_committed_first=strip)
+            elif not self._boundary_one_shot_done:
+                strip = bool(self.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False))
+                self._run_boundary_injection_pipeline(strip_committed_first=strip)
+                self.boundary.mark_one_shot_complete_if_applicable(self)
+        self._step_timing_mark(timing_marks, "boundary")
+
+        self._emit_inlet_segments()
+        self._emit_periodic_parallel_x_layers()
+        self._step_timing_mark(timing_marks, "emitter")
+        self.ss.update_segment_geometry()
+        self._step_timing_mark(timing_marks, "geom_pre")
+        self.compute_endpoint_velocity()
+        self._step_timing_mark(timing_marks, "velocity")
+        self.advect_segments_rk4()
+        self._step_timing_mark(timing_marks, "advect")
+        self.ss.update_segment_geometry()
+        self._step_timing_mark(timing_marks, "geom_post")
+        self.split_segments()
+        self._step_timing_mark(timing_marks, "split")
+        self.merge_segments()
+        self._step_timing_mark(timing_marks, "merge")
+        self.restore_frozen_segment_geometry()
+        self._step_timing_mark(timing_marks, "restore_frozen")
+        self.delete_weak_segments()
+        self._step_timing_mark(timing_marks, "delete")
+        if self._use_leapfrog_initial_impulse[None] == 1:
+            self._decay_impulse_kernel()
+        self._step_timing_mark(timing_marks, "impulse")
+        active_after = int(self.ss.segment_num[None])
+        self._step_timing_mark(timing_marks, "end")
+        self._step_timing_report(timing_marks, active_before, active_after)
+        self._sim_step_index += 1

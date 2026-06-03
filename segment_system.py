@@ -32,6 +32,7 @@ class SegmentSystem:
         self.length = ti.field(dtype=float, shape=self.segment_max_num)
         # 固定段心/段长对流时，在初始化末快照的参考几何
         self.center_ref = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
+        self.tangent_ref = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
         self.length_ref = ti.field(dtype=float, shape=self.segment_max_num)
 
     @ti.kernel
@@ -41,6 +42,7 @@ class SegmentSystem:
         self.age.fill(0.0)
         self.gamma.fill(0.0)
         self.length.fill(0.0)
+        self.length_ref.fill(0.0)
         self.seg_type.fill(0)
 
     @ti.func

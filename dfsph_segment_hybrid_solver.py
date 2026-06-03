@@ -103,6 +103,19 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         ).lower().strip()
         self._deposit_src_vis = 0 if _depsrc in ("raw", "vorticity") else 1
 
+        self._sph_velocity_to_segment_enabled = bool(
+            self.seg_cfg.get_cfg("sphVelocityToSegmentAdvectionEnabled", False)
+        )
+        self._sph_velocity_to_segment_scale = float(
+            self.seg_cfg.get_cfg("sphVelocityToSegmentAdvectionScale", 1.0)
+        )
+        self._sph_velocity_to_segment_blend = float(
+            self.seg_cfg.get_cfg("sphVelocityToSegmentAdvectionBlend", 1.0)
+        )
+        self._sph_velocity_to_segment_skip_type = int(
+            self.seg_cfg.get_cfg("boundarySegmentTypeId", 2)
+        ) if bool(self.seg_cfg.get_cfg("sphVelocityToSegmentAdvectionSkipBoundary", True)) else -1
+
         self.u_seg_bs = ti.Vector.field(
             3, dtype=float, shape=self.ps.particle_max_num
         )
@@ -185,6 +198,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 ssol.boundary.mark_one_shot_complete_if_applicable(ssol)
 
         ssol._emit_inlet_segments()
+        ssol._emit_periodic_parallel_x_layers()
         ssol.ss.update_segment_geometry()
         dbg_deposit = 0
         if self._sph_to_segment_deposit_enabled and self.sph_to_segment_blend > 0.0:
@@ -204,6 +218,13 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             )
             if dbg_deposit:
                 self._print_deposit_debug_maxima()
+        if self._sph_velocity_to_segment_enabled:
+            self._deposit_velocity_to_segments_advect_kernel(
+                float(self._sph_velocity_to_segment_blend),
+                float(self._sph_velocity_to_segment_scale),
+                int(self.ps.material_fluid),
+                int(self._sph_velocity_to_segment_skip_type),
+            )
         ssol.compute_endpoint_velocity()
         ssol.advect_segments_rk4()
         ssol.ss.update_segment_geometry()
@@ -236,6 +257,99 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             f"max_|g_tgt|={float(self._dep_dbg_max_g_tgt[None]):.6e} "
             f"max_|gamma|={float(self._dep_dbg_max_gamma[None]):.6e}"
         )
+
+    @ti.kernel
+    def _deposit_velocity_to_segments_advect_kernel(
+        self,
+        blend: float,
+        scale: float,
+        mf: ti.i32,
+        skip_seg_type: ti.i32,
+    ):
+        h = self.ps.support_radius
+        nseg = self.ss_seg.segment_num[None]
+        for i in range(nseg):
+            if self.ss_seg.active[i] != 1:
+                continue
+            if skip_seg_type >= 0 and self.ss_seg.seg_type[i] == skip_seg_type:
+                self.seg_solver.sph_advect_velocity_minus[i] *= 0.0
+                self.seg_solver.sph_advect_velocity_plus[i] *= 0.0
+                continue
+            xm = self.ss_seg.x_minus[i]
+            xp = self.ss_seg.x_plus[i]
+            wsum_m = 0.0
+            wsum_p = 0.0
+            if ti.static(self.ps.dim == 2):
+                vacc_m2 = ti.Vector([0.0, 0.0])
+                vacc_p2 = ti.Vector([0.0, 0.0])
+                for p in range(self.ps.particle_num[None]):
+                    if self.ps.material[p] != mf:
+                        continue
+                    rm = xm - self.ps.x[p]
+                    rnm = rm.norm()
+                    if rnm < h:
+                        mv_wm = self.ps.m_V[p] * self.cubic_kernel(rnm)
+                        vacc_m2 += mv_wm * self.ps.v[p]
+                        wsum_m += mv_wm
+                    rp = xp - self.ps.x[p]
+                    rnp = rp.norm()
+                    if rnp < h:
+                        mv_wp = self.ps.m_V[p] * self.cubic_kernel(rnp)
+                        vacc_p2 += mv_wp * self.ps.v[p]
+                        wsum_p += mv_wp
+                if wsum_m > 1e-12:
+                    v_target_m = scale * (vacc_m2 / wsum_m)
+                    self.seg_solver.sph_advect_velocity_minus[i] = (
+                        (1.0 - blend) * self.seg_solver.sph_advect_velocity_minus[i]
+                        + blend * v_target_m
+                    )
+                else:
+                    self.seg_solver.sph_advect_velocity_minus[i] *= (1.0 - blend)
+                if wsum_p > 1e-12:
+                    v_target_p = scale * (vacc_p2 / wsum_p)
+                    self.seg_solver.sph_advect_velocity_plus[i] = (
+                        (1.0 - blend) * self.seg_solver.sph_advect_velocity_plus[i]
+                        + blend * v_target_p
+                    )
+                else:
+                    self.seg_solver.sph_advect_velocity_plus[i] *= (1.0 - blend)
+            else:
+                vacc_m3 = ti.Vector([0.0, 0.0, 0.0])
+                vacc_p3 = ti.Vector([0.0, 0.0, 0.0])
+                for p in range(self.ps.particle_num[None]):
+                    if self.ps.material[p] != mf:
+                        continue
+                    rm = xm - self.ps.x[p]
+                    rnm = rm.norm()
+                    if rnm < h:
+                        mv_wm = self.ps.m_V[p] * self.cubic_kernel(rnm)
+                        vacc_m3 += mv_wm * self.ps.v[p]
+                        wsum_m += mv_wm
+                    rp = xp - self.ps.x[p]
+                    rnp = rp.norm()
+                    if rnp < h:
+                        mv_wp = self.ps.m_V[p] * self.cubic_kernel(rnp)
+                        vacc_p3 += mv_wp * self.ps.v[p]
+                        wsum_p += mv_wp
+                if wsum_m > 1e-12:
+                    v_target_m = scale * (vacc_m3 / wsum_m)
+                    self.seg_solver.sph_advect_velocity_minus[i] = (
+                        (1.0 - blend) * self.seg_solver.sph_advect_velocity_minus[i]
+                        + blend * v_target_m
+                    )
+                else:
+                    self.seg_solver.sph_advect_velocity_minus[i] *= (1.0 - blend)
+                if wsum_p > 1e-12:
+                    v_target_p = scale * (vacc_p3 / wsum_p)
+                    self.seg_solver.sph_advect_velocity_plus[i] = (
+                        (1.0 - blend) * self.seg_solver.sph_advect_velocity_plus[i]
+                        + blend * v_target_p
+                    )
+                else:
+                    self.seg_solver.sph_advect_velocity_plus[i] *= (1.0 - blend)
+        for i in range(nseg, self.ss_seg.segment_max_num):
+            self.seg_solver.sph_advect_velocity_minus[i] *= 0.0
+            self.seg_solver.sph_advect_velocity_plus[i] *= 0.0
 
     @ti.func
     def _vorticity_deposit_sample(self, p: int, src_vis: ti.i32) -> float:
