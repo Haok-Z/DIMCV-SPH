@@ -103,6 +103,8 @@ class SegmentBoundaryHandler:
         self._u_d = None  # (Nb,3) float32，用于调试：内部段诱导速度
         self._last_boundary_commit_count = 0
 
+        self._b_sph_vel = None  # (Nb,3) float32，SPH 速度插值到边界点后的速度
+
         self._gpu_boundary_cap_nb = max(1, int(self.nb))
         self._gpu_boundary_cap_ng = max(1, int(self.ng if self.ng > 0 else self.nb))
         self._gpu_boundary_b = ti.Vector.field(3, dtype=ti.f32, shape=self._gpu_boundary_cap_nb)
@@ -119,6 +121,94 @@ class SegmentBoundaryHandler:
     def set_particle_system(self, particle_system):
         """混合 DFSPH+Segment 求解器在构造后调用，以支持 boundarySampleSource=sph_solid。"""
         self._ps = particle_system
+
+    @staticmethod
+    def _cubic_kernel_value_np(r_norm: np.ndarray, h_support: float, dim: int) -> np.ndarray:
+        h_support = max(float(h_support), 1e-12)
+        inv_h = 1.0 / h_support
+        k = 1.0
+        if dim == 1:
+            k = 1.3333
+        elif dim == 2:
+            k = 1.8189
+        elif dim == 3:
+            k = 2.5465
+        k *= inv_h ** dim
+        q = r_norm * inv_h
+        out = np.zeros_like(r_norm, dtype=np.float32)
+        m0 = q <= 0.5
+        q0 = q[m0]
+        out[m0] = k * (6.0 * q0 * q0 * q0 - 6.0 * q0 * q0 + 1.0)
+        m1 = (q > 0.5) & (q <= 1.0)
+        q1 = q[m1]
+        out[m1] = k * 2.0 * np.power(1.0 - q1, 3.0)
+        return out.astype(np.float32, copy=False)
+
+    def _compute_boundary_sph_velocity(self) -> np.ndarray:
+        if not bool(self.ss.cfg.get_cfg("boundaryRhsIncludeSphVelocity", False)):
+            if self._b_points is None:
+                return np.zeros((0, 3), dtype=np.float32)
+            return np.zeros((int(self._b_points.shape[0]), 3), dtype=np.float32)
+        if self._ps is None or self._b_points is None:
+            if self._b_points is None:
+                return np.zeros((0, 3), dtype=np.float32)
+            return np.zeros((int(self._b_points.shape[0]), 3), dtype=np.float32)
+
+        ps = self._ps
+        nb = int(self._b_points.shape[0])
+        out = np.zeros((nb, 3), dtype=np.float32)
+        n = int(ps.particle_num[None])
+        if n <= 0 or nb <= 0:
+            return out
+
+        dim = int(ps.dim)
+        x = ps.x.to_numpy()[:n].astype(np.float32, copy=False)
+        v = ps.v.to_numpy()[:n].astype(np.float32, copy=False)
+        mat = ps.material.to_numpy()[:n]
+        mv = ps.m_V.to_numpy()[:n].astype(np.float32, copy=False)
+        fluid = mat == int(ps.material_fluid)
+        if not np.any(fluid):
+            return out
+
+        xf = x[fluid]
+        vf = v[fluid]
+        mvf = mv[fluid]
+        h = float(ps.support_radius) * float(self.ss.cfg.get_cfg("boundaryRhsSphVelocityKernelRadiusScale", 1.0))
+        h = max(h, 1e-12)
+        b = self._b_points[:, :dim].astype(np.float32, copy=False)
+        scale = float(self.ss.cfg.get_cfg("boundaryRhsSphVelocityScale", 1.0))
+        normal_only = bool(self.ss.cfg.get_cfg("boundaryRhsSphVelocityNormalOnly", True))
+
+        for i in range(nb):
+            r = b[i][None, :] - xf[:, :dim]
+            rn = np.linalg.norm(r, axis=1).astype(np.float32)
+            mask = rn < h
+            if not np.any(mask):
+                continue
+            w = mvf[mask] * self._cubic_kernel_value_np(rn[mask], h, dim)
+            wsum = float(np.sum(w))
+            if wsum <= 1e-12:
+                continue
+            ui = np.sum(vf[mask, :dim] * w[:, None], axis=0) / wsum
+            out[i, :dim] = ui.astype(np.float32, copy=False)
+
+        if normal_only and self._b_normals is not None and self._b_normals.shape[0] == nb:
+            nrm = self._b_normals[:, :dim].astype(np.float32, copy=False)
+            denom = np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-8
+            nhat = nrm / denom
+            comp = np.sum(out[:, :dim] * nhat, axis=1, keepdims=True)
+            out2 = np.zeros_like(out)
+            out2[:, :dim] = comp * nhat
+            out = out2
+        return (scale * out).astype(np.float32, copy=False)
+
+    def _boundary_velocity_for_rhs(self) -> np.ndarray:
+        if self._b_vel is None:
+            return np.zeros((0, 3), dtype=np.float32)
+        self._b_sph_vel = self._compute_boundary_sph_velocity()
+        if self._b_sph_vel.shape[0] != self._b_vel.shape[0]:
+            self._b_sph_vel = np.zeros_like(self._b_vel, dtype=np.float32)
+        return (self._b_vel - self._b_sph_vel).astype(np.float32, copy=False)
 
     def mark_one_shot_complete_if_applicable(self, solver) -> None:
         """
@@ -1387,6 +1477,11 @@ class SegmentBoundaryHandler:
         boundary_type = int(self.ss.cfg.get_cfg("boundarySegmentTypeId", 2))
         reg_radius = float(self.ss.cfg.get_cfg("regularizationRadiusR", 0.01))
         u_inf = self._get_background_velocity().astype(np.float32, copy=False)
+        ub_eff = self._boundary_velocity_for_rhs()
+        ub_host = np.zeros((self._gpu_boundary_cap_nb, 3), dtype=np.float32)
+        if ub_eff.shape[0] >= nb:
+            ub_host[:nb] = ub_eff[:nb].astype(np.float32, copy=False)
+        self._gpu_boundary_ub.from_numpy(ub_host)
         self._compute_rhs_2d_point_gpu_kernel(nb, ns, boundary_type, reg_radius, float(u_inf[0]), float(u_inf[1]), float(u_inf[2]))
         self._solve_gamma_projection_gpu_kernel(nb, ng)
         gamma = self._gpu_boundary_gamma.to_numpy()[:ng].astype(np.float32, copy=False)
@@ -1406,7 +1501,7 @@ class SegmentBoundaryHandler:
         if self._b_points is None or self._b_vel is None:
             return
         b = self._b_points.astype(np.float32, copy=False)
-        ub = self._b_vel.astype(np.float32, copy=False)
+        ub = self._boundary_velocity_for_rhs().astype(np.float32, copy=False)
         nb = int(b.shape[0])
         if nb == 0:
             return
@@ -1525,100 +1620,6 @@ class SegmentBoundaryHandler:
         else:
             self._g_gamma.fill(0.0)
         self._g_gamma[active_ids] = gamma_a
-
-    def release_vorticity_to_internal_segments(self):
-        """Release strong virtual boundary segments into movable internal segments."""
-        if not bool(self.ss.cfg.get_cfg("enableBoundaryVorticityRelease", False)):
-            return
-        if self._g_x_minus is None or self._g_x_plus is None or self._g_gamma is None:
-            return
-        if self.ss.dim != 2:
-            return
-
-        threshold = float(self.ss.cfg.get_cfg("boundaryReleaseGammaThreshold", 0.05))
-        scale = float(self.ss.cfg.get_cfg("boundaryReleaseScale", 0.2))
-        max_per = int(self.ss.cfg.get_cfg("boundaryReleaseMaxPerStep", 8))
-        if max_per <= 0 or scale == 0.0:
-            return
-
-        center_cfg = self.ss.cfg.get_cfg("boundaryCircleCenter", [0.65, 0.5])
-        circle_center = np.array(center_cfg, dtype=np.float32).ravel()
-        cx = float(circle_center[0]) if circle_center.size > 0 else 0.65
-        cy = float(circle_center[1]) if circle_center.size > 1 else 0.5
-        radius = float(self.ss.cfg.get_cfg("boundaryCircleRadius", 0.1))
-        rear_x = cx + float(self.ss.cfg.get_cfg("boundaryReleaseRearXOffset", 0.0))
-        offset = float(self.ss.cfg.get_cfg("boundaryReleaseOffset", 0.018))
-        st = int(self.ss.cfg.get_cfg("boundaryReleaseSegmentTypeId", self.ss.cfg.get_cfg("initSegmentTypeId", 0)))
-
-        xm = self._g_x_minus.astype(np.float32, copy=False)
-        xp = self._g_x_plus.astype(np.float32, copy=False)
-        gg = self._g_gamma.astype(np.float32, copy=False)
-        centers = 0.5 * (xm + xp)
-        strong = np.abs(gg) >= threshold
-        release_region = str(self.ss.cfg.get_cfg("boundaryReleaseRegion", "rear_half") or "rear_half").lower().strip()
-        if release_region in ("whole", "all", "whole_circle", "circle"):
-            rear = np.ones_like(strong, dtype=bool)
-        else:
-            rear = centers[:, 0] >= rear_x
-        near_circle = np.linalg.norm(centers[:, :2] - np.array([cx, cy], dtype=np.float32)[None, :], axis=1) <= radius + 3.0 * max(offset, 1e-6)
-        ids = np.nonzero(strong & rear & near_circle)[0]
-        if ids.size == 0:
-            return
-        selection_mode = str(self.ss.cfg.get_cfg("boundaryReleaseSelection", "balanced_sign") or "balanced_sign").lower().strip()
-        if selection_mode in ("balanced_sign", "sign_balanced", "positive_negative", "pos_neg"):
-            pos = ids[gg[ids] > 0.0]
-            neg = ids[gg[ids] < 0.0]
-            pos = pos[np.argsort(-np.abs(gg[pos]))]
-            neg = neg[np.argsort(-np.abs(gg[neg]))]
-            half = max_per // 2
-            chosen_parts = []
-            if half > 0:
-                chosen_parts.append(pos[:half])
-                chosen_parts.append(neg[:half])
-            chosen = np.concatenate(chosen_parts) if len(chosen_parts) > 0 else np.zeros((0,), dtype=np.int64)
-            if chosen.size < max_per:
-                chosen_set = set(int(i) for i in chosen.tolist())
-                rest = np.array([int(i) for i in ids if int(i) not in chosen_set], dtype=np.int64)
-                if rest.size > 0:
-                    rest = rest[np.argsort(-np.abs(gg[rest]))]
-                    chosen = np.concatenate([chosen, rest[: max_per - chosen.size]])
-            ids = chosen.astype(np.int64, copy=False)
-        else:
-            order = ids[np.argsort(-np.abs(gg[ids]))]
-            ids = order[:max_per]
-
-        new_xm = np.zeros((ids.size, 3), dtype=np.float32)
-        new_xp = np.zeros((ids.size, 3), dtype=np.float32)
-        new_g = np.zeros((ids.size,), dtype=np.float32)
-        cxy = np.array([cx, cy], dtype=np.float32)
-        for out_i, src_i in enumerate(ids):
-            c = centers[src_i].copy()
-            n2 = c[:2] - cxy
-            ln = float(np.linalg.norm(n2))
-            if ln < 1e-8:
-                n2 = np.array([1.0, 0.0], dtype=np.float32)
-                ln = 1.0
-            n2 = n2 / ln
-            shift = np.array([n2[0] * offset, n2[1] * offset, 0.0], dtype=np.float32)
-            new_xm[out_i] = xm[src_i] + shift
-            new_xp[out_i] = xp[src_i] + shift
-            new_g[out_i] = float(scale * gg[src_i])
-
-        offset_idx = int(self.ss.segment_num[None])
-        cap = int(self.ss.segment_max_num)
-        if offset_idx >= cap:
-            return
-        n_new = min(int(ids.size), cap - offset_idx)
-        if n_new <= 0:
-            return
-        self._commit_segments_kernel(offset_idx, n_new, new_xm[:n_new], new_xp[:n_new], new_g[:n_new], st)
-        self.ss.segment_num[None] = offset_idx + n_new
-
-        if bool(self.ss.cfg.get_cfg("boundaryReleaseLog", False)):
-            print(
-                f"[boundary-release] released {n_new} internal segments "
-                f"(|gamma| max={float(np.max(np.abs(new_g[:n_new]))):.4e})"
-            )
 
     def commit_boundary_segments(self):
         """

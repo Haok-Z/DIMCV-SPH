@@ -53,10 +53,26 @@ class SegmentSolver:
         self._advect_fix_segment_center = bool(
             self.ss.cfg.get_cfg("advectFixSegmentCenter", False)
         )
-        self._advect_fix_segment_length = bool(
-            self.ss.cfg.get_cfg("advectFixSegmentLength", False)
+        self._advect_fix_segment_length = bool(self.ss.cfg.get_cfg("advectFixSegmentLength", False))
+        self._segment_advect_use_bs = ti.field(dtype=ti.i32, shape=())
+        self._segment_advect_use_sph = ti.field(dtype=ti.i32, shape=())
+        self._segment_advect_use_background = ti.field(dtype=ti.i32, shape=())
+        adv_mode = str(self.ss.cfg.get_cfg("segmentAdvectionMode", "") or "").lower().strip()
+        initial_sph_then_bs = adv_mode in (
+            "initial_sph_velocity_then_bs",
+            "sph_initial_then_bs",
+            "initial_sph_then_bs",
+            "bs_with_initial_sph_velocity",
         )
-        # 仅用于涡段端点 RK4 平流；对 SPH 的 BS 耦合见 accumulate_bs_*（不含此项）
+        if initial_sph_then_bs:
+            self._segment_advect_use_bs[None] = 1
+            self._segment_advect_use_sph[None] = 1
+            self._segment_advect_use_background[None] = 0
+        else:
+            self._segment_advect_use_bs[None] = 1 if bool(self.ss.cfg.get_cfg("segmentAdvectionUseBiotSavart", True)) else 0
+            self._segment_advect_use_sph[None] = 1 if bool(self.ss.cfg.get_cfg("segmentAdvectionUseSphVelocity", True)) else 0
+            self._segment_advect_use_background[None] = 1 if bool(self.ss.cfg.get_cfg("segmentAdvectionUseBackground", True)) else 0
+
         self.u_inf = ti.Vector.field(3, dtype=float, shape=())
         self.u_inf.from_numpy(self.advection_background_velocity)
         self._grav_add = ti.Vector.field(3, dtype=float, shape=())
@@ -107,6 +123,17 @@ class SegmentSolver:
         self._bs_2d_point = _segment_cfg_use_2d_point_vortex_bs(
             self.ss.cfg, self.ss.dim
         )
+        self._bs_2d_normal_sign = ti.field(dtype=float, shape=())
+        _normal_dir = str(
+            self.ss.cfg.get_cfg("pointVortex2DNormalDirection", "out") or "out"
+        ).lower().strip()
+        _normal_sign_cfg = self.ss.cfg.get_cfg("pointVortex2DNormalSign", None)
+        if _normal_sign_cfg is not None:
+            self._bs_2d_normal_sign[None] = 1.0 if float(_normal_sign_cfg) >= 0.0 else -1.0
+        elif _normal_dir in ("in", "inward", "inside", "negative", "-z", "clockwise"):
+            self._bs_2d_normal_sign[None] = -1.0
+        else:
+            self._bs_2d_normal_sign[None] = 1.0
         sch = str(self.ss.cfg.get_cfg("boundaryInjectionSchedule", "each_step") or "each_step").lower().strip()
         if sch in ("init", "initialize", "initialize_only", "once", "static", "static_once"):
             self._boundary_schedule = "initialize_only"
@@ -117,12 +144,6 @@ class SegmentSolver:
         self._step_timing_enabled = bool(self.ss.cfg.get_cfg("debugStepTiming", False))
         self._step_timing_interval = max(1, int(self.ss.cfg.get_cfg("debugStepTimingInterval", 1)))
         self._step_timing_sync = bool(self.ss.cfg.get_cfg("debugStepTimingSync", True))
-        self._emitter_interval_override = None
-        self._emitter_slot_cursor = 0
-        self._emitter_rng = np.random.default_rng(
-            int(self.ss.cfg.get_cfg("emitterSeed", 0) or 0)
-        )
-
         _vd = self.ss.dim
         self.v_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
         self.v_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
@@ -148,6 +169,12 @@ class SegmentSolver:
         self.sph_advect_velocity = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
         self.sph_advect_velocity_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
         self.sph_advect_velocity_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self.initial_sph_advect_remaining = ti.field(dtype=ti.i32, shape=self.ss.segment_max_num)
+        self.point_vortex_volume = ti.field(dtype=float, shape=self.ss.segment_max_num)
+        self._compact_sph_advect_velocity_minus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self._compact_sph_advect_velocity_plus = ti.Vector.field(_vd, dtype=float, shape=self.ss.segment_max_num)
+        self._compact_initial_sph_advect_remaining = ti.field(dtype=ti.i32, shape=self.ss.segment_max_num)
+        self._compact_point_vortex_volume = ti.field(dtype=float, shape=self.ss.segment_max_num)
 
         self._fz_a = ti.field(dtype=ti.i32, shape=())
         self._fz_b = ti.field(dtype=ti.i32, shape=())
@@ -422,7 +449,6 @@ class SegmentSolver:
         if self.boundary._uses_random_boundary_virtual():
             self.boundary.generate_boundary_segments_random()
             self.boundary.commit_boundary_segments()
-            self.boundary.release_vorticity_to_internal_segments()
         else:
             self.boundary.generate_boundary_segments()
             if (not bool(self.ss.cfg.get_cfg("boundaryProjectionCache", True))) or self.boundary._K is None:
@@ -431,7 +457,6 @@ class SegmentSolver:
                 self.boundary.compute_rhs()
                 self.boundary.solve_linear_system()
             self.boundary.commit_boundary_segments()
-            self.boundary.release_vorticity_to_internal_segments()
         self.ss.update_segment_geometry()
         if self.boundary._last_boundary_commit_count > 0:
             self.snapshot_frozen_segment_geometry()
@@ -1191,6 +1216,9 @@ class SegmentSolver:
             self.ss.active[i] = 1
             self.ss.age[i] = 0.0
             self.ss.seg_type[i] = seg_type
+            d = self.ss.x_plus[i] - self.ss.x_minus[i]
+            r = 0.5 * d.norm()
+            self.point_vortex_volume[i] = ti.math.pi * r * r
 
     @ti.func
     def _bs_velocity_2d_point_vortex(
@@ -1203,8 +1231,9 @@ class SegmentSolver:
         rx = x_query[0] - x_vortex[0]
         ry = x_query[1] - x_vortex[1]
         r2 = rx * rx + ry * ry + 1e-12
-        ux = inv2pi * Gamma * (-ry) / (r2 + R2)
-        uy = inv2pi * Gamma * (rx) / (r2 + R2)
+        normal_sign = self._bs_2d_normal_sign[None]
+        ux = normal_sign * inv2pi * Gamma * (-ry) / (r2 + R2)
+        uy = normal_sign * inv2pi * Gamma * (rx) / (r2 + R2)
         return ti.Vector([ux, uy])
 
     def compute_endpoint_velocity(self):
@@ -1249,11 +1278,17 @@ class SegmentSolver:
 
             xmi = self.ss.x_minus[i]
             xpi = self.ss.x_plus[i]
-            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
-            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
+            ui_m = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            ui_p = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            if self._segment_advect_use_background[None] != 0:
+                ui_m += self._segment_background(i)
+                ui_p += self._segment_background(i)
+            if self._segment_advect_use_sph[None] != 0:
+                ui_m += self.sph_advect_velocity_minus[i]
+                ui_p += self.sph_advect_velocity_plus[i]
 
             for j in range(n):
-                if j == i or self.ss.active[j] != 1:
+                if self._segment_advect_use_bs[None] == 0 or j == i or self.ss.active[j] != 1:
                     continue
 
                 xmj = self.ss.x_minus[j]
@@ -1283,7 +1318,7 @@ class SegmentSolver:
     def _compute_endpoint_velocity_bs_2d_point(self, reg_radius: float):
         """
         TOG2021 式 (7)：二维点涡 u^BS = Γ/(2π) e_z×(x−x_j)/(|x−x_j|²+R²)。
-        每段以中点 x_j 与 Γ_j = γ_j L_j 参与求和（式 (8) 的离散项）。
+        point_vortex_2d 中每条 2D 段只代表一个段心点涡；x_minus/x_plus 仅作可视化外壳。
         """
         R2 = reg_radius * reg_radius
         n = self.ss.segment_num[None]
@@ -1292,30 +1327,28 @@ class SegmentSolver:
             if self.ss.active[i] != 1:
                 continue
 
-            xmi = self.ss.x_minus[i]
-            xpi = self.ss.x_plus[i]
-            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
-            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
+            xi = 0.5 * (self.ss.x_minus[i] + self.ss.x_plus[i])
+            ui = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            if self._segment_advect_use_background[None] != 0:
+                ui += self._segment_background(i)
+            if self._segment_advect_use_sph[None] != 0:
+                ui += 0.5 * (
+                    self.sph_advect_velocity_minus[i]
+                    + self.sph_advect_velocity_plus[i]
+                )
 
             for j in range(n):
-                if j == i or self.ss.active[j] != 1:
+                if self._segment_advect_use_bs[None] == 0 or j == i or self.ss.active[j] != 1:
                     continue
 
-                am = self.ss.x_minus[j]
-                ap = self.ss.x_plus[j]
-                cj = 0.5 * (am + ap)
-                Lj = (ap - am).norm() + 1e-8
-                Gamma = self.ss.gamma[j] * Lj
+                cj = 0.5 * (self.ss.x_minus[j] + self.ss.x_plus[j])
+                Gamma = self.ss.gamma[j]
+                bs = self._bs_velocity_2d_point_vortex(xi, cj, Gamma, R2)
+                ui[0] += bs[0]
+                ui[1] += bs[1]
 
-                bs_m = self._bs_velocity_2d_point_vortex(xmi, cj, Gamma, R2)
-                bs_p = self._bs_velocity_2d_point_vortex(xpi, cj, Gamma, R2)
-                ui_m[0] += bs_m[0]
-                ui_m[1] += bs_m[1]
-                ui_p[0] += bs_p[0]
-                ui_p[1] += bs_p[1]
-
-            self.v_minus[i] = ui_m
-            self.v_plus[i] = ui_p
+            self.v_minus[i] = ui
+            self.v_plus[i] = ui
 
     @ti.kernel
     def _compute_endpoint_velocity_bs_finite(self, reg_radius: float):
@@ -1339,11 +1372,17 @@ class SegmentSolver:
 
             xmi = self.ss.x_minus[i]
             xpi = self.ss.x_plus[i]
-            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
-            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
+            ui_m = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            ui_p = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            if self._segment_advect_use_background[None] != 0:
+                ui_m += self._segment_background(i)
+                ui_p += self._segment_background(i)
+            if self._segment_advect_use_sph[None] != 0:
+                ui_m += self.sph_advect_velocity_minus[i]
+                ui_p += self.sph_advect_velocity_plus[i]
 
             for j in range(n):
-                if j == i or self.ss.active[j] != 1:
+                if self._segment_advect_use_bs[None] == 0 or j == i or self.ss.active[j] != 1:
                     continue
 
                 am = self.ss.x_minus[j]
@@ -1380,7 +1419,7 @@ class SegmentSolver:
             self.v_minus[i] = ui_m
             self.v_plus[i] = ui_p
 
-    def accumulate_bs_velocity_at_fluid_particles(self, ps, out_u, reg_radius: float):
+    def accumulate_bs_velocity_at_fluid_particles(self, ps, out_u, reg_radius: float, skip_seg_type: int = -999999):
         """
         For each fluid particle at ``ps.x[p]``, sum **pure Biot–Savart** from active segments.
 
@@ -1397,6 +1436,7 @@ class SegmentSolver:
                 int(ps.material_fluid),
                 out_u,
                 float(reg_radius),
+                int(skip_seg_type),
             )
             return
         if not self._bs_finite:
@@ -1410,6 +1450,7 @@ class SegmentSolver:
             int(ps.material_fluid),
             out_u,
             float(reg_radius),
+            int(skip_seg_type),
         )
 
     @ti.kernel
@@ -1421,6 +1462,7 @@ class SegmentSolver:
         mf: ti.i32,
         out_u: ti.template(),
         reg_radius: float,
+        skip_seg_type: ti.i32,
     ):
         R2 = reg_radius * reg_radius
         nseg = self.ss.segment_num[None]
@@ -1432,13 +1474,12 @@ class SegmentSolver:
             ux = 0.0
             uy = 0.0
             for j in range(nseg):
-                if self.ss.active[j] != 1:
+                if self.ss.active[j] != 1 or self.ss.seg_type[j] == skip_seg_type:
                     continue
                 am = self.ss.x_minus[j]
                 ap = self.ss.x_plus[j]
                 cj = 0.5 * (am + ap)
-                Lj = (ap - am).norm() + 1e-8
-                Gamma = self.ss.gamma[j] * Lj
+                Gamma = self.ss.gamma[j]
                 bsu = self._bs_velocity_2d_point_vortex(xp_query, cj, Gamma, R2)
                 ux += bsu[0]
                 uy += bsu[1]
@@ -1453,6 +1494,7 @@ class SegmentSolver:
         mf: ti.i32,
         out_u: ti.template(),
         reg_radius: float,
+        skip_seg_type: ti.i32,
     ):
         inv4pi = 1.0 / (4.0 * ti.math.pi)
         R2 = reg_radius * reg_radius
@@ -1464,7 +1506,7 @@ class SegmentSolver:
             xp_query = x[p]
             u = ti.Vector([0.0, 0.0, 0.0])
             for j in range(nseg):
-                if self.ss.active[j] != 1:
+                if self.ss.active[j] != 1 or self.ss.seg_type[j] == skip_seg_type:
                     continue
                 am = self.ss.x_minus[j]
                 ap = self.ss.x_plus[j]
@@ -1589,7 +1631,7 @@ class SegmentSolver:
         out_plus: ti.template(),
         reg_radius: float,
     ):
-        """RK4 子步：在 x + factor*dt*k 处用论文式 (7) 求诱导速度。"""
+        """RK4 子步：2D point vortex 只在段心采样速度，并将同一速度写给两个端点。"""
         R2 = reg_radius * reg_radius
         n = self.ss.segment_num[None]
 
@@ -1597,31 +1639,34 @@ class SegmentSolver:
             if self.ss.active[i] != 1:
                 continue
 
-            xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
-            xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
+            xi = 0.5 * (
+                self.ss.x_minus[i]
+                + factor * self.dt * k_minus_in[i]
+                + self.ss.x_plus[i]
+                + factor * self.dt * k_plus_in[i]
+            )
 
-            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
-            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
+            ui = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            if self._segment_advect_use_background[None] != 0:
+                ui += self._segment_background(i)
+            if self._segment_advect_use_sph[None] != 0:
+                ui += 0.5 * (
+                    self.sph_advect_velocity_minus[i]
+                    + self.sph_advect_velocity_plus[i]
+                )
 
             for j in range(n):
-                if j == i or self.ss.active[j] != 1:
+                if self._segment_advect_use_bs[None] == 0 or j == i or self.ss.active[j] != 1:
                     continue
 
-                am = self.ss.x_minus[j]
-                ap = self.ss.x_plus[j]
-                cj = 0.5 * (am + ap)
-                Lj = (ap - am).norm() + 1e-8
-                Gamma = self.ss.gamma[j] * Lj
+                cj = 0.5 * (self.ss.x_minus[j] + self.ss.x_plus[j])
+                Gamma = self.ss.gamma[j]
+                bs = self._bs_velocity_2d_point_vortex(xi, cj, Gamma, R2)
+                ui[0] += bs[0]
+                ui[1] += bs[1]
 
-                bs_m = self._bs_velocity_2d_point_vortex(xmi, cj, Gamma, R2)
-                bs_p = self._bs_velocity_2d_point_vortex(xpi, cj, Gamma, R2)
-                ui_m[0] += bs_m[0]
-                ui_m[1] += bs_m[1]
-                ui_p[0] += bs_p[0]
-                ui_p[1] += bs_p[1]
-
-            out_minus[i] = ui_m
-            out_plus[i] = ui_p
+            out_minus[i] = ui
+            out_plus[i] = ui
 
     @ti.kernel
     def _compute_velocity_at_factor_blob(
@@ -1646,11 +1691,17 @@ class SegmentSolver:
             xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
             xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
 
-            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
-            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
+            ui_m = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            ui_p = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            if self._segment_advect_use_background[None] != 0:
+                ui_m += self._segment_background(i)
+                ui_p += self._segment_background(i)
+            if self._segment_advect_use_sph[None] != 0:
+                ui_m += self.sph_advect_velocity_minus[i]
+                ui_p += self.sph_advect_velocity_plus[i]
 
             for j in range(n):
-                if j == i or self.ss.active[j] != 1:
+                if self._segment_advect_use_bs[None] == 0 or j == i or self.ss.active[j] != 1:
                     continue
 
                 xmj = self.ss.x_minus[j]
@@ -1693,11 +1744,17 @@ class SegmentSolver:
             xmi = self.ss.x_minus[i] + factor * self.dt * k_minus_in[i]
             xpi = self.ss.x_plus[i] + factor * self.dt * k_plus_in[i]
 
-            ui_m = self._segment_background(i) + self.sph_advect_velocity_minus[i]
-            ui_p = self._segment_background(i) + self.sph_advect_velocity_plus[i]
+            ui_m = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            ui_p = ti.Vector([0.0 for _ in ti.static(range(self.ss.dim))])
+            if self._segment_advect_use_background[None] != 0:
+                ui_m += self._segment_background(i)
+                ui_p += self._segment_background(i)
+            if self._segment_advect_use_sph[None] != 0:
+                ui_m += self.sph_advect_velocity_minus[i]
+                ui_p += self.sph_advect_velocity_plus[i]
 
             for j in range(n):
-                if j == i or self.ss.active[j] != 1:
+                if self._segment_advect_use_bs[None] == 0 or j == i or self.ss.active[j] != 1:
                     continue
 
                 am = self.ss.x_minus[j]
@@ -1849,18 +1906,30 @@ class SegmentSolver:
                 self._compact_gamma[j] = self.ss.gamma[i]
                 self._compact_age[j] = self.ss.age[i]
                 self._compact_seg_type[j] = self.ss.seg_type[i]
+                self._compact_sph_advect_velocity_minus[j] = self.sph_advect_velocity_minus[i]
+                self._compact_sph_advect_velocity_plus[j] = self.sph_advect_velocity_plus[i]
+                self._compact_initial_sph_advect_remaining[j] = self.initial_sph_advect_remaining[i]
+                self._compact_point_vortex_volume[j] = self.point_vortex_volume[i]
 
     @ti.kernel
     def _copy_compacted_segments_kernel(self, n_old: int):
         n_new = self._compact_counter[None]
         for i in range(n_old):
             self.ss.active[i] = 0
+            self.sph_advect_velocity_minus[i] *= 0.0
+            self.sph_advect_velocity_plus[i] *= 0.0
+            self.initial_sph_advect_remaining[i] = 0
+            self.point_vortex_volume[i] = 0.0
         for i in range(n_new):
             self.ss.x_minus[i] = self._compact_x_minus[i]
             self.ss.x_plus[i] = self._compact_x_plus[i]
             self.ss.gamma[i] = self._compact_gamma[i]
             self.ss.age[i] = self._compact_age[i]
             self.ss.seg_type[i] = self._compact_seg_type[i]
+            self.sph_advect_velocity_minus[i] = self._compact_sph_advect_velocity_minus[i]
+            self.sph_advect_velocity_plus[i] = self._compact_sph_advect_velocity_plus[i]
+            self.initial_sph_advect_remaining[i] = self._compact_initial_sph_advect_remaining[i]
+            self.point_vortex_volume[i] = self._compact_point_vortex_volume[i]
             self.ss.active[i] = 1
             d = self.ss.tangent_ref[i]
             l = d.norm() + 1e-8
@@ -1885,6 +1954,10 @@ class SegmentSolver:
         active = self.ss.active.to_numpy()[:n].astype(np.int32)
         age = self.ss.age.to_numpy()[:n].astype(np.float32)
         seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
+        sph_v_minus = self.sph_advect_velocity_minus.to_numpy()[:n].astype(np.float32)
+        sph_v_plus = self.sph_advect_velocity_plus.to_numpy()[:n].astype(np.float32)
+        initial_remaining = self.initial_sph_advect_remaining.to_numpy()[:n].astype(np.int32)
+        point_vortex_volume = self.point_vortex_volume.to_numpy()[:n].astype(np.float32)
 
         skip_topo = self._topology_skip_type_ids()
         if self._delete_weak_segments_gpu(n, skip_topo):
@@ -1941,12 +2014,23 @@ class SegmentSolver:
         out_t = seg_type[idx]
 
         self._overwrite_segments_kernel(new_n, out_xm, out_xp, out_g, out_a, out_t)
+        self._overwrite_initial_sph_advect_state_kernel(
+            new_n,
+            sph_v_minus[idx],
+            sph_v_plus[idx],
+            initial_remaining[idx],
+        )
+        self._overwrite_point_vortex_volume_kernel(new_n, point_vortex_volume[idx])
         self.ss.segment_num[None] = new_n
 
     @ti.kernel
     def _clear_active_kernel(self, n_old: int):
         for i in range(n_old):
             self.ss.active[i] = 0
+            self.sph_advect_velocity_minus[i] *= 0.0
+            self.sph_advect_velocity_plus[i] *= 0.0
+            self.initial_sph_advect_remaining[i] = 0
+            self.point_vortex_volume[i] = 0.0
 
     def delete_weak_segments(self):
         n = int(self.ss.segment_num[None])
@@ -2029,6 +2113,10 @@ class SegmentSolver:
                 self.ss.active[new_idx] = 1
                 self.ss.age[new_idx] = 0.0
                 self.ss.seg_type[new_idx] = self.ss.seg_type[i]
+                self.sph_advect_velocity_minus[new_idx] = self.sph_advect_velocity_minus[i]
+                self.sph_advect_velocity_plus[new_idx] = self.sph_advect_velocity_plus[i]
+                self.initial_sph_advect_remaining[new_idx] = self.initial_sph_advect_remaining[i]
+                self.point_vortex_volume[new_idx] = self.point_vortex_volume[i]
             else:
                 # 容量不足：回滚计数（尽量保持一致）
                 ti.atomic_add(self.ss.segment_num[None], -1)
@@ -2077,6 +2165,9 @@ class SegmentSolver:
         center = self.ss.center.to_numpy()[:n].astype(np.float32)
         tangent = self.ss.tangent.to_numpy()[:n].astype(np.float32)
         length = self.ss.length.to_numpy()[:n].astype(np.float32)
+        sph_v_minus = self.sph_advect_velocity_minus.to_numpy()[:n].astype(np.float32)
+        sph_v_plus = self.sph_advect_velocity_plus.to_numpy()[:n].astype(np.float32)
+        initial_remaining = self.initial_sph_advect_remaining.to_numpy()[:n].astype(np.int32)
 
         used = np.zeros((n,), dtype=bool)
         out_xm = []
@@ -2084,6 +2175,10 @@ class SegmentSolver:
         out_g = []
         out_a = []
         out_t = []
+        out_vm = []
+        out_vp = []
+        out_rem = []
+        out_vol = []
 
         for i in range(n):
             if active[i] != 1 or used[i]:
@@ -2095,6 +2190,10 @@ class SegmentSolver:
                 out_g.append(gamma[i])
                 out_a.append(age[i])
                 out_t.append(seg_type[i])
+                out_vm.append(sph_v_minus[i])
+                out_vp.append(sph_v_plus[i])
+                out_rem.append(initial_remaining[i])
+                out_vol.append(point_vortex_volume[i])
                 continue
 
             # 找到可合并的最佳候选 j（最近）
@@ -2129,6 +2228,10 @@ class SegmentSolver:
                 out_g.append(gamma[i])
                 out_a.append(age[i])
                 out_t.append(seg_type[i])
+                out_vm.append(sph_v_minus[i])
+                out_vp.append(sph_v_plus[i])
+                out_rem.append(initial_remaining[i])
+                out_vol.append(point_vortex_volume[i])
                 continue
 
             j = best_j
@@ -2162,6 +2265,18 @@ class SegmentSolver:
             out_g.append(np.float32(g_new))
             out_a.append(np.float32(min(age[i], age[j])))
             out_t.append(seg_type[i])
+            rem_i = int(initial_remaining[i])
+            rem_j = int(initial_remaining[j])
+            if rem_i >= rem_j:
+                out_vm.append(sph_v_minus[i])
+                out_vp.append(sph_v_plus[i])
+                out_rem.append(rem_i)
+                out_vol.append(point_vortex_volume[i])
+            else:
+                out_vm.append(sph_v_minus[j])
+                out_vp.append(sph_v_plus[j])
+                out_rem.append(rem_j)
+                out_vol.append(point_vortex_volume[j])
 
         new_n = len(out_xm)
         if new_n <= 0:
@@ -2175,6 +2290,15 @@ class SegmentSolver:
         out_t = np.asarray(out_t, dtype=np.int32)
 
         self._overwrite_segments_kernel(new_n, out_xm, out_xp, out_g, out_a, out_t)
+        self._overwrite_initial_sph_advect_state_kernel(
+            new_n,
+            np.asarray(out_vm, dtype=np.float32),
+            np.asarray(out_vp, dtype=np.float32),
+            np.asarray(out_rem, dtype=np.int32),
+        )
+        self._overwrite_point_vortex_volume_kernel(
+            new_n, np.asarray(out_vol, dtype=np.float32)
+        )
         self.ss.segment_num[None] = new_n
 
     @ti.kernel
@@ -2197,6 +2321,39 @@ class SegmentSolver:
             self.ss.age[i] = age[i]
             self.ss.seg_type[i] = seg_type[i]
             self.ss.active[i] = 1
+            self.sph_advect_velocity_minus[i] *= 0.0
+            self.sph_advect_velocity_plus[i] *= 0.0
+            self.initial_sph_advect_remaining[i] = 0
+            d = self.ss.x_plus[i] - self.ss.x_minus[i]
+            r = 0.5 * d.norm()
+            self.point_vortex_volume[i] = ti.math.pi * r * r
+
+    @ti.kernel
+    def _overwrite_initial_sph_advect_state_kernel(
+        self,
+        new_n: int,
+        sph_v_minus: ti.types.ndarray(),
+        sph_v_plus: ti.types.ndarray(),
+        remaining: ti.types.ndarray(),
+    ):
+        for i in range(new_n):
+            if ti.static(self.ss.dim == 2):
+                self.sph_advect_velocity_minus[i] = ti.Vector([sph_v_minus[i, 0], sph_v_minus[i, 1]])
+                self.sph_advect_velocity_plus[i] = ti.Vector([sph_v_plus[i, 0], sph_v_plus[i, 1]])
+            else:
+                self.sph_advect_velocity_minus[i] = ti.Vector([sph_v_minus[i, 0], sph_v_minus[i, 1], sph_v_minus[i, 2]])
+                self.sph_advect_velocity_plus[i] = ti.Vector([sph_v_plus[i, 0], sph_v_plus[i, 1], sph_v_plus[i, 2]])
+            self.initial_sph_advect_remaining[i] = remaining[i]
+
+    @ti.kernel
+    def _overwrite_point_vortex_volume_kernel(self, new_n: int, volumes: ti.types.ndarray()):
+        for i in range(new_n):
+            self.point_vortex_volume[i] = volumes[i]
+
+    @ti.kernel
+    def _set_point_vortex_volume_kernel(self, offset: int, n_new: int, volumes: ti.types.ndarray()):
+        for k in range(n_new):
+            self.point_vortex_volume[offset + k] = volumes[k]
 
     def _merge_candidate_indices_from_grid(self, grid, cell, radius: int, dim: int):
         if dim == 2:
@@ -2237,6 +2394,10 @@ class SegmentSolver:
         seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
         center = self.ss.center.to_numpy()[:n].astype(np.float32)
         tangent = self.ss.tangent.to_numpy()[:n].astype(np.float32)
+        sph_v_minus = self.sph_advect_velocity_minus.to_numpy()[:n].astype(np.float32)
+        sph_v_plus = self.sph_advect_velocity_plus.to_numpy()[:n].astype(np.float32)
+        initial_remaining = self.initial_sph_advect_remaining.to_numpy()[:n].astype(np.int32)
+        point_vortex_volume = self.point_vortex_volume.to_numpy()[:n].astype(np.float32)
 
         d = int(self.ss.dim)
         use_hash = bool(self.ss.cfg.get_cfg("mergeSpatialHashEnabled", True))
@@ -2268,6 +2429,10 @@ class SegmentSolver:
         out_g = []
         out_a = []
         out_t = []
+        out_vm = []
+        out_vp = []
+        out_rem = []
+        out_vol = []
         merge_dist2 = merge_dist * merge_dist
 
         for i in range(n):
@@ -2280,6 +2445,10 @@ class SegmentSolver:
                 out_g.append(gamma[i])
                 out_a.append(age[i])
                 out_t.append(seg_type[i])
+                out_vm.append(sph_v_minus[i])
+                out_vp.append(sph_v_plus[i])
+                out_rem.append(initial_remaining[i])
+                out_vol.append(point_vortex_volume[i])
                 continue
 
             best_j = -1
@@ -2329,6 +2498,10 @@ class SegmentSolver:
                 out_g.append(gamma[i])
                 out_a.append(age[i])
                 out_t.append(seg_type[i])
+                out_vm.append(sph_v_minus[i])
+                out_vp.append(sph_v_plus[i])
+                out_rem.append(initial_remaining[i])
+                out_vol.append(point_vortex_volume[i])
                 continue
 
             j = best_j
@@ -2358,6 +2531,18 @@ class SegmentSolver:
             out_g.append(np.float32(g_new))
             out_a.append(np.float32(min(age[i], age[j])))
             out_t.append(seg_type[i])
+            rem_i = int(initial_remaining[i])
+            rem_j = int(initial_remaining[j])
+            if rem_i >= rem_j:
+                out_vm.append(sph_v_minus[i])
+                out_vp.append(sph_v_plus[i])
+                out_rem.append(rem_i)
+                out_vol.append(point_vortex_volume[i])
+            else:
+                out_vm.append(sph_v_minus[j])
+                out_vp.append(sph_v_plus[j])
+                out_rem.append(rem_j)
+                out_vol.append(point_vortex_volume[j])
 
         new_n = len(out_xm)
         if new_n <= 0:
@@ -2371,6 +2556,15 @@ class SegmentSolver:
             np.asarray(out_g, dtype=np.float32),
             np.asarray(out_a, dtype=np.float32),
             np.asarray(out_t, dtype=np.int32),
+        )
+        self._overwrite_initial_sph_advect_state_kernel(
+            new_n,
+            np.asarray(out_vm, dtype=np.float32),
+            np.asarray(out_vp, dtype=np.float32),
+            np.asarray(out_rem, dtype=np.int32),
+        )
+        self._overwrite_point_vortex_volume_kernel(
+            new_n, np.asarray(out_vol, dtype=np.float32)
         )
         self.ss.segment_num[None] = new_n
 
@@ -2398,6 +2592,10 @@ class SegmentSolver:
         seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
         length = self.ss.length.to_numpy()[:n].astype(np.float32)
         center = self.ss.center.to_numpy()[:n].astype(np.float32)
+        sph_v_minus = self.sph_advect_velocity_minus.to_numpy()[:n].astype(np.float32)
+        sph_v_plus = self.sph_advect_velocity_plus.to_numpy()[:n].astype(np.float32)
+        initial_remaining = self.initial_sph_advect_remaining.to_numpy()[:n].astype(np.int32)
+        point_vortex_volume = self.point_vortex_volume.to_numpy()[:n].astype(np.float32)
 
         keep = (active == 1)
 
@@ -2451,6 +2649,13 @@ class SegmentSolver:
         out_t = seg_type[idx]
 
         self._overwrite_segments_kernel(new_n, out_xm, out_xp, out_g, out_a, out_t)
+        self._overwrite_initial_sph_advect_state_kernel(
+            new_n,
+            sph_v_minus[idx],
+            sph_v_plus[idx],
+            initial_remaining[idx],
+        )
+        self._overwrite_point_vortex_volume_kernel(new_n, point_vortex_volume[idx])
         self.ss.segment_num[None] = new_n
 
     def _strip_segments_of_type(self, type_id: int):
@@ -2463,6 +2668,10 @@ class SegmentSolver:
         active = self.ss.active.to_numpy()[:n].astype(np.int32)
         age = self.ss.age.to_numpy()[:n].astype(np.float32)
         seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
+        sph_v_minus = self.sph_advect_velocity_minus.to_numpy()[:n].astype(np.float32)
+        sph_v_plus = self.sph_advect_velocity_plus.to_numpy()[:n].astype(np.float32)
+        initial_remaining = self.initial_sph_advect_remaining.to_numpy()[:n].astype(np.int32)
+        point_vortex_volume = self.point_vortex_volume.to_numpy()[:n].astype(np.float32)
         if not np.any((active == 1) & (seg_type == int(type_id))):
             return
         keep = (active == 1) & (seg_type != int(type_id))
@@ -2480,6 +2689,13 @@ class SegmentSolver:
             age[idx],
             seg_type[idx],
         )
+        self._overwrite_initial_sph_advect_state_kernel(
+            new_n,
+            sph_v_minus[idx],
+            sph_v_plus[idx],
+            initial_remaining[idx],
+        )
+        self._overwrite_point_vortex_volume_kernel(new_n, point_vortex_volume[idx])
         self.ss.segment_num[None] = new_n
 
     def _resolve_emitter_inlet_bounds(self):
@@ -2778,7 +2994,6 @@ class SegmentSolver:
                 self._run_boundary_injection_pipeline(strip_committed_first=strip)
                 self.boundary.mark_one_shot_complete_if_applicable(self)
 
-        self._emit_inlet_segments()
         self._emit_periodic_parallel_x_layers()
         self.ss.update_segment_geometry()
         self.compute_endpoint_velocity()
@@ -2812,7 +3027,6 @@ class SegmentSolver:
                 self.boundary.mark_one_shot_complete_if_applicable(self)
         self._step_timing_mark(timing_marks, "boundary")
 
-        self._emit_inlet_segments()
         self._emit_periodic_parallel_x_layers()
         self._step_timing_mark(timing_marks, "emitter")
         self.ss.update_segment_geometry()

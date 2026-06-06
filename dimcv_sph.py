@@ -30,6 +30,12 @@ class DIMCVSPHSolver(SPHBase):
         self.d_vort = ti.Vector.field(3,
                                       dtype=float,
                                       shape=self.ps.particle_max_num)
+        self.vorticity_pred = ti.Vector.field(3,
+                                              dtype=float,
+                                              shape=self.ps.particle_max_num)
+        self.vorticity_loss_use_pred = bool(
+            self.ps.cfg.get_cfg("vorticityLossUsePredictedOmega", False)
+        )
         self.d_vort_smoothed = ti.Vector.field(3,
                                                dtype=float,
                                                shape=self.ps.particle_max_num)
@@ -291,6 +297,31 @@ class DIMCVSPHSolver(SPHBase):
             self.ps.for_all_neighbors(p_i, self.compute_vorticity_task_diff,
                                       vort)
             self.ps.vorticity[p_i] = vort
+
+    @ti.func
+    def compute_vorticity_laplacian_task(self, p_i, p_j, lap: ti.template()):
+        if self.ps.material[p_j] == self.ps.material_fluid:
+            r = self.ps.x[p_i] - self.ps.x[p_j]
+            grad_w = self.cubic_kernel_derivative(r)
+            coeff = 2.0 * (self.ps.dim + 2.0) * self.ps.m_V[p_j] * r.dot(grad_w) / (
+                r.norm_sqr() + 0.01 * self.ps.support_radius**2
+            )
+            lap += coeff * (self.ps.vorticity[p_i] - self.ps.vorticity[p_j])
+
+    @ti.kernel
+    def compute_vorticity_pred(self):
+        self.vorticity_pred.fill(0.0)
+        for p_i in range(self.ps.particle_num[None]):
+            if self.ps.material[p_i] != self.ps.material_fluid:
+                continue
+            omega = self.ps.vorticity[p_i]
+            lap = ti.Vector([0.0 for _ in ti.static(range(3))])
+            self.ps.for_all_neighbors(p_i, self.compute_vorticity_laplacian_task,
+                                      lap)
+            rhs = self.viscosity * lap
+            if ti.static(self.ps.dim == 3):
+                rhs += self.grad_v[p_i] @ omega
+            self.vorticity_pred[p_i] = omega + self.dt[None] * rhs
 
     @ti.func
     def get_produce_prob(self, kvn, t):
@@ -579,8 +610,22 @@ class DIMCVSPHSolver(SPHBase):
             curl_v_star = ti.Vector([0.0 for _ in ti.static(range(3))])
             self.ps.for_all_neighbors(p_i, self.compute_curl_v_star_task,
                                       curl_v_star)
-            d_vorticity = self.ps.vorticity[p_i] - curl_v_star
-            self.d_vort[p_i] = d_vorticity
+            omega_ref = self.ps.vorticity[p_i]
+            if ti.static(self.vorticity_loss_use_pred):
+                omega_ref = self.vorticity_pred[p_i]
+            self.d_vort[p_i] = omega_ref - curl_v_star
+            self.d_vort[p_i] = omega_ref - curl_v_star
+
+    @ti.kernel
+    def compute_d_vorticity_pred(self):
+        self.d_vort.fill(0.0)
+        for p_i in range(self.ps.particle_num[None]):
+            if self.ps.material[p_i] != self.ps.material_fluid:
+                continue
+            curl_v_star = ti.Vector([0.0 for _ in ti.static(range(3))])
+            self.ps.for_all_neighbors(p_i, self.compute_curl_v_star_task,
+                                      curl_v_star)
+            self.d_vort[p_i] = self.vorticity_pred[p_i] - curl_v_star
 
     def pressure_solve_iteration(self):
         self.pressure_solve_iteration_kernel()
@@ -826,6 +871,8 @@ class DIMCVSPHSolver(SPHBase):
 
     def dimcv(self):
         self.init()
+        if self.vorticity_loss_use_pred:
+            self.compute_vorticity_pred()
         self.compute_d_vorticity()
         self.compute_all_d_vort_smoothed()
         self.update_sample()

@@ -149,7 +149,7 @@
     "exportSegmentPLY": true,
     "exportPLYAxisConvention": "xy",
 
-    "sphSegmentBsCoupling": 0.05,
+    "sphSegmentBsCoupling": 1.0,
     "sphToSegmentGammaBlend": 0.08,
     "sphToSegmentGammaProjection": "norm_signed",
     "sphToSegmentDepositSource": "vorticity_vis",
