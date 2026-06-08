@@ -42,6 +42,7 @@ Notes:
 import taichi as ti
 import matplotlib.pyplot as plt
 import numpy as np
+import time
 from pathlib import Path
 from matplotlib.colors import Normalize, to_rgba
 from matplotlib.collections import LineCollection
@@ -140,6 +141,9 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self.u_seg_bs = ti.Vector.field(
             3, dtype=float, shape=self.ps.particle_max_num
         )
+        self.u_vortex_ghost_sph = ti.Vector.field(
+            self.ps.dim, dtype=float, shape=self.ps.particle_max_num
+        )
         self._feedback_mode = str(
             self.seg_cfg.get_cfg(
                 "sphSegmentFeedbackMode",
@@ -147,11 +151,21 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             )
             or "bs_direct"
         ).lower().strip()
-        self._vortex_ghost_feedback = self._feedback_mode in (
+        self._vortex_ghost_velocity_feedback = self._feedback_mode in (
             "vortex_ghost_velocity",
             "ghost_velocity",
             "velocity_ghost",
             "ghost",
+        )
+        self._vortex_ghost_displacement_feedback = self._feedback_mode in (
+            "vortex_ghost_displacement",
+            "ghost_displacement",
+            "displacement_ghost",
+            "ghost_position",
+        )
+        self._vortex_ghost_feedback = (
+            self._vortex_ghost_velocity_feedback
+            or self._vortex_ghost_displacement_feedback
         )
         self._vortex_ghost_beta = float(
             self.seg_cfg.get_cfg("vortexGhostVelocityCouplingBeta", self.segment_bs_coupling_beta)
@@ -249,6 +263,22 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self._sph_vort_debug_interval = max(
             1, int(self.seg_cfg.get_cfg("sphVorticityDebugPrintInterval", 10))
         )
+        self._debug_last_residual_particle = -1
+        self._substep_timing_enabled = bool(
+            self.seg_cfg.get_cfg("debugHybridSubstepTiming", False)
+        )
+        self._substep_timing_interval = max(
+            1, int(self.seg_cfg.get_cfg("debugHybridSubstepTimingInterval", 10))
+        )
+        self._substep_timing_sync = bool(
+            self.seg_cfg.get_cfg("debugHybridSubstepTimingSync", True)
+        )
+        self._segment_timing_enabled = bool(
+            self.seg_cfg.get_cfg("debugSegmentAdvanceTiming", False)
+        )
+        self._segment_timing_interval = max(
+            1, int(self.seg_cfg.get_cfg("debugSegmentAdvanceTimingInterval", self._substep_timing_interval))
+        )
 
     def initialize(self):
         super().initialize()
@@ -267,6 +297,130 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             ssol._run_boundary_injection_pipeline(strip_committed_first=False)
             ssol.boundary.mark_one_shot_complete_if_applicable(ssol)
             self.ss_seg.update_segment_geometry()
+
+    def _cubic_kernel_np(self, r_norm, support_radius: float):
+        h = float(support_radius)
+        if h <= 1e-12:
+            return np.zeros_like(np.asarray(r_norm, dtype=np.float64))
+        q = np.asarray(r_norm, dtype=np.float64) / h
+        if int(self.ps.dim) == 2:
+            k = 1.8189 / (h * h)
+        elif int(self.ps.dim) == 3:
+            k = 2.5465 / (h * h * h)
+        else:
+            k = 1.3333 / h
+        w = np.zeros_like(q, dtype=np.float64)
+        m0 = q <= 0.5
+        m1 = (q > 0.5) & (q <= 1.0)
+        w[m0] = k * (6.0 * q[m0] ** 3 - 6.0 * q[m0] ** 2 + 1.0)
+        w[m1] = k * 2.0 * (1.0 - q[m1]) ** 3
+        return w
+
+    def _cubic_kernel_grad_np(self, r_vec, support_radius: float):
+        h = float(support_radius)
+        rv = np.asarray(r_vec, dtype=np.float64)
+        if h <= 1e-12 or rv.size == 0:
+            return np.zeros_like(rv, dtype=np.float64)
+        rn = np.linalg.norm(rv, axis=1)
+        q = rn / h
+        if int(self.ps.dim) == 2:
+            k = 1.8189 / (h * h)
+        elif int(self.ps.dim) == 3:
+            k = 2.5465 / (h * h * h)
+        else:
+            k = 1.3333 / h
+        dwdq = np.zeros_like(q, dtype=np.float64)
+        m0 = q <= 0.5
+        m1 = (q > 0.5) & (q <= 1.0)
+        dwdq[m0] = k * (18.0 * q[m0] ** 2 - 12.0 * q[m0])
+        dwdq[m1] = k * (-6.0 * (1.0 - q[m1]) ** 2)
+        dwdr = dwdq / h
+        grad = np.zeros_like(rv, dtype=np.float64)
+        nz = rn > 1e-12
+        grad[nz] = rv[nz] * (dwdr[nz] / rn[nz])[:, None]
+        return grad
+
+    def _active_point_vortex_arrays(self):
+        nseg = int(self.ss_seg.segment_num[None])
+        dim = int(self.ps.dim)
+        if nseg <= 0:
+            empty_x = np.zeros((0, dim), dtype=np.float32)
+            empty_1 = np.zeros((0,), dtype=np.float32)
+            return empty_x, empty_1, empty_1, empty_x
+        active = self.ss_seg.active.to_numpy()[:nseg] == 1
+        seg_type = self.ss_seg.seg_type.to_numpy()[:nseg]
+        skip_type = int(self._vortex_ghost_skip_type if self._vortex_ghost_skip_boundary else -999999)
+        if self._vortex_ghost_skip_boundary:
+            active = active & (seg_type != skip_type)
+        idx = np.nonzero(active)[0]
+        if idx.size == 0:
+            empty_x = np.zeros((0, dim), dtype=np.float32)
+            empty_1 = np.zeros((0,), dtype=np.float32)
+            return empty_x, empty_1, empty_1, empty_x
+        xm = self.ss_seg.x_minus.to_numpy()[:nseg, :dim]
+        xp = self.ss_seg.x_plus.to_numpy()[:nseg, :dim]
+        centers = (0.5 * (xm[idx] + xp[idx])).astype(np.float32)
+        gamma = self.ss_seg.gamma.to_numpy()[:nseg][idx].astype(np.float32)
+        volume = self.seg_solver.point_vortex_volume.to_numpy()[:nseg][idx].astype(np.float32)
+        vm = self.seg_solver.v_minus.to_numpy()[:nseg, :dim]
+        vp = self.seg_solver.v_plus.to_numpy()[:nseg, :dim]
+        vel = (0.5 * (vm[idx] + vp[idx])).astype(np.float32)
+        return centers, gamma, volume, vel
+
+    def _estimate_vortex_omega_from_gamma_at_points(self, points, support_radius: float):
+        pts = np.asarray(points, dtype=np.float32)
+        out = np.zeros((pts.shape[0], 3), dtype=np.float32)
+        centers, gamma, volume, _ = self._active_point_vortex_arrays()
+        if pts.size == 0 or centers.shape[0] == 0:
+            return out
+        valid = np.isfinite(gamma) & np.isfinite(volume) & (volume > 1e-12)
+        if not np.any(valid):
+            return out
+        centers = centers[valid]
+        gamma = gamma[valid].astype(np.float64)
+        volume = volume[valid].astype(np.float64)
+        for i, p in enumerate(pts[:, : centers.shape[1]]):
+            r = p[None, :] - centers
+            rn = np.linalg.norm(r, axis=1)
+            near = rn < float(support_radius)
+            if not np.any(near):
+                continue
+            w = self._cubic_kernel_np(rn[near], support_radius)
+            wsum = float(np.sum(volume[near] * w))
+            if wsum > 1e-12:
+                out[i, 2] = float(np.sum(w * gamma[near]) / wsum)
+        return out
+
+    def _estimate_vortex_omega_from_velocity_curl_at_points(self, points, support_radius: float):
+        pts = np.asarray(points, dtype=np.float32)
+        out = np.zeros((pts.shape[0], 3), dtype=np.float32)
+        if int(self.ps.dim) != 2:
+            return out
+        centers, _, volume, vel = self._active_point_vortex_arrays()
+        if pts.size == 0 or centers.shape[0] == 0:
+            return out
+        valid = np.isfinite(volume) & (volume > 1e-12)
+        if not np.any(valid):
+            return out
+        centers = centers[valid].astype(np.float64)
+        volume = volume[valid].astype(np.float64)
+        vel = vel[valid].astype(np.float64)
+        for i, p in enumerate(pts[:, :2].astype(np.float64)):
+            r = p[None, :] - centers
+            rn = np.linalg.norm(r, axis=1)
+            near = rn < float(support_radius)
+            if not np.any(near):
+                continue
+            w = self._cubic_kernel_np(rn[near], support_radius)
+            wsum = float(np.sum(volume[near] * w))
+            if wsum <= 1e-12:
+                continue
+            ui = np.sum((volume[near] * w)[:, None] * vel[near], axis=0) / wsum
+            grad = self._cubic_kernel_grad_np(r[near], support_radius)
+            dv = vel[near] - ui[None, :]
+            curl_z = np.sum(volume[near] * (dv[:, 1] * grad[:, 0] - dv[:, 0] * grad[:, 1]))
+            out[i, 2] = float(curl_z)
+        return out
 
     def _inject_segments_from_sph_boundary_vorticity(self):
         if not bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionEnabled", False)):
@@ -498,18 +652,45 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         xp = np.zeros((idx.size, 3), dtype=np.float32)
         xm[:, :dim] = xm_d
         xp[:, :dim] = xp_d
+        gamma_source_vort = vort
+        residual_enabled = bool(
+            self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionUseResidualVorticity", False)
+        ) or vort_src in (
+            "vorticity_residual",
+            "residual_vorticity",
+            "vorticity_minus_vortex",
+            "sph_vorticity_residual",
+        )
+        omega_vortex_gamma_sel = None
+        omega_vortex_curl_sel = None
+        if residual_enabled:
+            support = float(
+                self.ps.support_radius
+                * float(self.seg_cfg.get_cfg("sphBoundaryVortexResidualSupportRadiusScale", 1.0))
+            )
+            omega_vortex_gamma_sel = self._estimate_vortex_omega_from_gamma_at_points(
+                centers, support
+            )
+            gamma_source_vort = vort.copy()
+            gamma_source_vort[idx, :3] = vort[idx, :3] - omega_vortex_gamma_sel[:, :3]
+            if bool(self.seg_cfg.get_cfg("sphBoundaryVorticityResidualDebug", False)):
+                omega_vortex_curl_sel = self._estimate_vortex_omega_from_velocity_curl_at_points(
+                    centers, support
+                )
         gamma_mode = str(
             self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionGammaMode", "omega_dot_t")
             or "omega_dot_t"
         ).lower().strip()
+        gamma_omega_z = gamma_source_vort[:, 2]
+        gamma_omega_mag = np.linalg.norm(gamma_source_vort, axis=1).astype(np.float32)
         if gamma_mode in ("omega_norm", "source_norm", "norm", "magnitude"):
-            gamma = (gamma_scale * omega_mag[idx] * mv[idx]).astype(np.float32)
+            gamma = (gamma_scale * gamma_omega_mag[idx] * mv[idx]).astype(np.float32)
         elif gamma_mode in ("omega_dot_t", "source_dot_t", "dot_t", "projection"):
-            gamma = (gamma_scale * np.sum(vort[idx, :dim] * tangent, axis=1) * mv[idx]).astype(np.float32)
+            gamma = (gamma_scale * np.sum(gamma_source_vort[idx, :dim] * tangent, axis=1) * mv[idx]).astype(np.float32)
         elif gamma_mode in ("source_component", "omega_component", "z", "z_component"):
-            gamma = (gamma_scale * omega_z[idx] * mv[idx]).astype(np.float32)
+            gamma = (gamma_scale * gamma_omega_z[idx] * mv[idx]).astype(np.float32)
         else:
-            gamma = (gamma_scale * omega_z[idx] * mv[idx]).astype(np.float32)
+            gamma = (gamma_scale * gamma_omega_z[idx] * mv[idx]).astype(np.float32)
 
         offset = int(self.ss_seg.segment_num[None])
         cap = int(self.ss_seg.segment_max_num)
@@ -529,6 +710,24 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 offset, n_new, init_vel, int(self._initial_sph_advect_steps)
             )
         self.ss_seg.segment_num[None] = offset + n_new
+        if residual_enabled and bool(self.seg_cfg.get_cfg("sphBoundaryVorticityResidualDebug", False)):
+            dbg_local = int(
+                np.argmax(np.abs(gamma[:n_new])) if n_new > 0 else 0
+            )
+            dbg_p = int(idx[dbg_local])
+            self._debug_last_residual_particle = dbg_p
+            ov_g = omega_vortex_gamma_sel[dbg_local] if omega_vortex_gamma_sel is not None else np.zeros((3,), dtype=np.float32)
+            ov_c = omega_vortex_curl_sel[dbg_local] if omega_vortex_curl_sel is not None else np.zeros((3,), dtype=np.float32)
+            res_v = gamma_source_vort[dbg_p]
+            print(
+                f"[sph-vort-residual-debug] step={step} particle={dbg_p} "
+                f"pos=({float(x[dbg_p, 0]):.4f},{float(x[dbg_p, 1]):.4f}) "
+                f"omega_sph_z={float(vort[dbg_p, 2]):.6e} "
+                f"omega_vortex_gamma_z={float(ov_g[2]):.6e} "
+                f"omega_vortex_curl_z={float(ov_c[2]):.6e} "
+                f"omega_res_z={float(res_v[2]):.6e} "
+                f"gamma_new={float(gamma[dbg_local]):.6e}"
+            )
         if bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSignDebug", False)):
             print(
                 f"[sph-vort-inject-sign] step={step} "
@@ -700,6 +899,74 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         if bool(self.seg_cfg.get_cfg("deleteInsideObstacleLog", False)):
             print(f"[segment-obstacle-cull] removed={int(np.sum(remove))} kept={int(idx.size)}")
 
+    def _delete_slow_internal_point_vortices(self):
+        if not bool(self.seg_cfg.get_cfg("deleteSlowPointVorticesEnabled", False)):
+            return
+        n = int(self.ss_seg.segment_num[None])
+        if n <= 0:
+            return
+        threshold = float(self.seg_cfg.get_cfg("deleteSlowPointVortexSpeedThreshold", 1e-6))
+        if threshold <= 0.0:
+            return
+        boundary_type = int(self.seg_cfg.get_cfg("boundarySegmentTypeId", 2))
+        target = self.seg_cfg.get_cfg("deleteSlowPointVortexSegmentTypeIds", None)
+        if target is None:
+            target_types = {int(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentTypeId", 0))}
+        else:
+            target_types = set(int(t) for t in target)
+        dim = int(self.ss_seg.dim)
+        x_minus = self.ss_seg.x_minus.to_numpy()[:n].astype(np.float32)
+        x_plus = self.ss_seg.x_plus.to_numpy()[:n].astype(np.float32)
+        gamma = self.ss_seg.gamma.to_numpy()[:n].astype(np.float32)
+        active = self.ss_seg.active.to_numpy()[:n].astype(np.int32)
+        age = self.ss_seg.age.to_numpy()[:n].astype(np.float32)
+        seg_type = self.ss_seg.seg_type.to_numpy()[:n].astype(np.int32)
+        sph_v_minus = self.seg_solver.sph_advect_velocity_minus.to_numpy()[:n].astype(np.float32)
+        sph_v_plus = self.seg_solver.sph_advect_velocity_plus.to_numpy()[:n].astype(np.float32)
+        initial_remaining = self.seg_solver.initial_sph_advect_remaining.to_numpy()[:n].astype(np.int32)
+        point_vortex_volume = self.seg_solver.point_vortex_volume.to_numpy()[:n].astype(np.float32)
+        v_minus = self.seg_solver.v_minus.to_numpy()[:n, :dim].astype(np.float32)
+        v_plus = self.seg_solver.v_plus.to_numpy()[:n, :dim].astype(np.float32)
+        speed = np.linalg.norm(0.5 * (v_minus + v_plus), axis=1)
+        candidate = (
+            (active == 1)
+            & (seg_type != boundary_type)
+            & np.isin(seg_type, list(target_types))
+        )
+        remove = candidate & (speed < np.float32(threshold))
+        if not np.any(remove):
+            return
+        keep = (active == 1) & (~remove)
+        idx = np.nonzero(keep)[0]
+        if idx.size == 0:
+            self.ss_seg.segment_num[None] = 0
+            return
+        self.seg_solver._overwrite_segments_kernel(
+            int(idx.size),
+            x_minus[idx],
+            x_plus[idx],
+            gamma[idx],
+            age[idx],
+            seg_type[idx].astype(np.int32),
+        )
+        self.seg_solver._overwrite_initial_sph_advect_state_kernel(
+            int(idx.size),
+            sph_v_minus[idx],
+            sph_v_plus[idx],
+            initial_remaining[idx],
+        )
+        self.seg_solver._overwrite_point_vortex_volume_kernel(
+            int(idx.size), point_vortex_volume[idx]
+        )
+        self.ss_seg.segment_num[None] = int(idx.size)
+        self.ss_seg.update_segment_geometry()
+        if bool(self.seg_cfg.get_cfg("deleteSlowPointVortexLog", False)):
+            print(
+                f"[slow-point-vortex-cull] removed={int(np.sum(remove))} "
+                f"kept={int(idx.size)} threshold={threshold:.6e} "
+                f"min_speed={float(np.min(speed[candidate])) if np.any(candidate) else 0.0:.6e}"
+            )
+
     def _clear_one_step_internal_point_vortices(self):
         n = int(self.ss_seg.segment_num[None])
         if n <= 0:
@@ -772,77 +1039,153 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
 
     def _advance_segments_coupled(self):
         ssol = self.seg_solver
-        if ssol.has_boundary:
-            if ssol._boundary_schedule == "each_step":
-                strip = bool(
-                    ssol.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False)
-                )
-                ssol._run_boundary_injection_pipeline(strip_committed_first=strip)
-            elif not ssol._boundary_one_shot_done:
-                strip = bool(
-                    ssol.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False)
-                )
-                ssol._run_boundary_injection_pipeline(strip_committed_first=strip)
-                ssol.boundary.mark_one_shot_complete_if_applicable(ssol)
+        timing = self._segment_timing_enabled and (
+            int(ssol._sim_step_index) % self._segment_timing_interval == 0
+        )
+        records = []
 
-        ssol._emit_periodic_parallel_x_layers()
-        self._inject_segments_from_sph_boundary_vorticity()
-        ssol.ss.update_segment_geometry()
-        dbg_deposit = 0
-        if self._sph_to_segment_deposit_enabled and self.sph_to_segment_blend > 0.0:
-            if self._deposit_debug:
-                self._deposit_debug_step += 1
-                if self._deposit_debug_step % self._deposit_debug_interval == 0:
-                    dbg_deposit = 1
-                    self._deposit_debug_reset()
-            self._deposit_vorticity_to_segments_kernel(
-                float(self.sph_to_segment_blend),
-                float(self.sph_to_segment_gamma_scale),
-                int(self.ps.material_fluid),
-                int(self._deposit_gamma_proj),
-                int(self._deposit_src_vis),
-                dbg_deposit,
-                int(self._deposit_skip_seg_type),
-            )
-            if dbg_deposit:
-                self._print_deposit_debug_maxima()
-        if self._sph_velocity_to_segment_enabled and not self._segment_initial_sph_then_bs:
-            self._deposit_velocity_to_segments_advect_kernel(
-                float(self._sph_velocity_to_segment_blend),
-                float(self._sph_velocity_to_segment_scale),
-                int(self.ps.material_fluid),
-                int(self._sph_velocity_to_segment_skip_type),
-            )
+        def sync_if_needed():
+            if timing and self._substep_timing_sync:
+                ti.sync()
+
+        def run_stage(name, fn):
+            if not timing:
+                fn()
+                return
+            sync_if_needed()
+            t0 = time.perf_counter()
+            fn()
+            sync_if_needed()
+            records.append((name, (time.perf_counter() - t0) * 1000.0))
+
+        def boundary_pipeline():
+            if ssol.has_boundary:
+                if ssol._boundary_schedule == "each_step":
+                    strip = bool(
+                        ssol.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False)
+                    )
+                    ssol._run_boundary_injection_pipeline(strip_committed_first=strip)
+                elif not ssol._boundary_one_shot_done:
+                    strip = bool(
+                        ssol.ss.cfg.get_cfg("boundaryReplaceCommittedEachStep", False)
+                    )
+                    ssol._run_boundary_injection_pipeline(strip_committed_first=strip)
+                    ssol.boundary.mark_one_shot_complete_if_applicable(ssol)
+
+        def periodic_emit():
+            ssol._emit_periodic_parallel_x_layers()
+
+        def residual_vorticity_injection():
+            self._inject_segments_from_sph_boundary_vorticity()
+
+        def update_segment_geometry_pre():
+            ssol.ss.update_segment_geometry()
+
+        def vorticity_deposit_to_segments():
+            dbg_deposit = 0
+            if self._sph_to_segment_deposit_enabled and self.sph_to_segment_blend > 0.0:
+                if self._deposit_debug:
+                    self._deposit_debug_step += 1
+                    if self._deposit_debug_step % self._deposit_debug_interval == 0:
+                        dbg_deposit = 1
+                        self._deposit_debug_reset()
+                self._deposit_vorticity_to_segments_kernel(
+                    float(self.sph_to_segment_blend),
+                    float(self.sph_to_segment_gamma_scale),
+                    int(self.ps.material_fluid),
+                    int(self._deposit_gamma_proj),
+                    int(self._deposit_src_vis),
+                    dbg_deposit,
+                    int(self._deposit_skip_seg_type),
+                )
+                if dbg_deposit:
+                    self._print_deposit_debug_maxima()
+
+        def sph_velocity_deposit_to_segments():
+            if self._sph_velocity_to_segment_enabled and not self._segment_initial_sph_then_bs:
+                self._deposit_velocity_to_segments_advect_kernel(
+                    float(self._sph_velocity_to_segment_blend),
+                    float(self._sph_velocity_to_segment_scale),
+                    int(self.ps.material_fluid),
+                    int(self._sph_velocity_to_segment_skip_type),
+                )
+
+        run_stage("boundary_pipeline", boundary_pipeline)
+        run_stage("periodic_emit", periodic_emit)
+        run_stage("residual_vorticity_injection", residual_vorticity_injection)
+        run_stage("update_segment_geometry_pre", update_segment_geometry_pre)
+        run_stage("vorticity_deposit_to_segments", vorticity_deposit_to_segments)
+        run_stage("sph_velocity_deposit_to_segments", sph_velocity_deposit_to_segments)
+
         if self._one_step_vortex_impulse:
-            self._delete_interior_segments_inside_obstacles()
+            run_stage("delete_inside_obstacles", self._delete_interior_segments_inside_obstacles)
             old_bg = int(ssol._segment_advect_use_background[None])
             old_sph = int(ssol._segment_advect_use_sph[None])
             old_bs = int(ssol._segment_advect_use_bs[None])
             ssol._segment_advect_use_background[None] = 0
             ssol._segment_advect_use_sph[None] = 0
             ssol._segment_advect_use_bs[None] = 1
-            ssol.compute_endpoint_velocity()
+            run_stage("compute_endpoint_velocity", ssol.compute_endpoint_velocity)
             ssol._segment_advect_use_background[None] = old_bg
             ssol._segment_advect_use_sph[None] = old_sph
             ssol._segment_advect_use_bs[None] = old_bs
-            ssol.ss.update_segment_geometry()
+            run_stage("update_segment_geometry_post", ssol.ss.update_segment_geometry)
         else:
-            ssol.compute_endpoint_velocity()
-            ssol.advect_segments_rk4()
+            sph_advect_bs_ghost = bool(
+                self.seg_cfg.get_cfg("segmentSphAdvectButGhostUseBsVelocity", False)
+            )
+            if sph_advect_bs_ghost:
+                old_bg = int(ssol._segment_advect_use_background[None])
+                old_sph = int(ssol._segment_advect_use_sph[None])
+                old_bs = int(ssol._segment_advect_use_bs[None])
+                ssol._segment_advect_use_background[None] = 0
+                ssol._segment_advect_use_sph[None] = 1
+                ssol._segment_advect_use_bs[None] = 0
+                run_stage("compute_endpoint_velocity", ssol.compute_endpoint_velocity)
+                run_stage("advect_segments_rk4", ssol.advect_segments_rk4)
+                ssol._segment_advect_use_background[None] = old_bg
+                ssol._segment_advect_use_sph[None] = old_sph
+                ssol._segment_advect_use_bs[None] = old_bs
+            else:
+                run_stage("compute_endpoint_velocity", ssol.compute_endpoint_velocity)
+                run_stage("advect_segments_rk4", ssol.advect_segments_rk4)
             if self._segment_initial_sph_then_bs:
-                self._advance_segment_initial_sph_advect_velocity_kernel(
-                    float(self._initial_sph_advect_decay)
+                run_stage(
+                    "initial_sph_advect_decay",
+                    lambda: self._advance_segment_initial_sph_advect_velocity_kernel(
+                        float(self._initial_sph_advect_decay)
+                    ),
                 )
-            ssol.ss.update_segment_geometry()
-            self._delete_interior_segments_inside_obstacles()
+            run_stage("update_segment_geometry_post", ssol.ss.update_segment_geometry)
+            run_stage("delete_inside_obstacles", self._delete_interior_segments_inside_obstacles)
+            run_stage("delete_slow_point_vortices", self._delete_slow_internal_point_vortices)
             if not getattr(ssol, "_bs_2d_point", False):
-                ssol.split_segments()
-                ssol.merge_segments()
-                ssol.restore_frozen_segment_geometry()
-            ssol.delete_weak_segments()
-        self._print_internal_segment_gamma_debug()
+                run_stage("split_segments", ssol.split_segments)
+                run_stage("merge_segments", ssol.merge_segments)
+                run_stage("restore_frozen_segment_geometry", ssol.restore_frozen_segment_geometry)
+            run_stage("delete_weak_segments", ssol.delete_weak_segments)
+            if sph_advect_bs_ghost:
+                old_bg = int(ssol._segment_advect_use_background[None])
+                old_sph = int(ssol._segment_advect_use_sph[None])
+                old_bs = int(ssol._segment_advect_use_bs[None])
+                ssol._segment_advect_use_background[None] = 0
+                ssol._segment_advect_use_sph[None] = 0
+                ssol._segment_advect_use_bs[None] = 1
+                run_stage("recompute_bs_velocity_for_ghost", ssol.compute_endpoint_velocity)
+                ssol._segment_advect_use_background[None] = old_bg
+                ssol._segment_advect_use_sph[None] = old_sph
+                ssol._segment_advect_use_bs[None] = old_bs
+        run_stage("print_internal_segment_gamma_debug", self._print_internal_segment_gamma_debug)
         if ssol._use_leapfrog_initial_impulse[None] == 1:
-            ssol._decay_impulse_kernel()
+            run_stage("decay_impulse", ssol._decay_impulse_kernel)
+
+        if timing:
+            total = sum(v for _, v in records)
+            parts = " ".join(f"{name}={ms:.3f}ms" for name, ms in records)
+            print(
+                f"[segment-advance-timing] step={int(ssol._sim_step_index)} "
+                f"total={total:.3f}ms {parts}"
+            )
         ssol._sim_step_index += 1
 
     @ti.kernel
@@ -867,6 +1210,40 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             f"max_|gamma|={float(self._dep_dbg_max_gamma[None]):.6e}"
         )
 
+    @ti.func
+    def _sample_sph_velocity_at_position_from_grid(self, pos, mf: ti.i32):
+        h = self.ps.support_radius
+        center_cell = self.ps.pos_to_index(pos)
+        vacc = ti.Vector([0.0 for _ in ti.static(range(self.ps.dim))])
+        wsum = 0.0
+        for offset in ti.grouped(ti.ndrange(*((-1, 2),) * self.ps.dim)):
+            cell = center_cell + offset
+            valid = 1
+            for d in ti.static(range(self.ps.dim)):
+                if cell[d] < 0 or cell[d] >= self.ps.grid_num[d]:
+                    valid = 0
+            if valid == 0:
+                continue
+            flat = -1
+            if ti.static(self.ps.dim == 2):
+                flat = self.ps.flatten_grid_index_2d(cell)
+            else:
+                flat = self.ps.flatten_grid_index_3d(cell)
+            start = 0
+            if flat > 0:
+                start = self.ps.grid_particles_num[flat - 1]
+            end = self.ps.grid_particles_num[flat]
+            for p in range(start, end):
+                if self.ps.material[p] != mf:
+                    continue
+                r = pos - self.ps.x[p]
+                rn = r.norm()
+                if rn < h:
+                    mv_w = self.ps.m_V[p] * self.cubic_kernel(rn)
+                    vacc += mv_w * self.ps.v[p]
+                    wsum += mv_w
+        return vacc, wsum
+
     @ti.kernel
     def _deposit_velocity_to_segments_advect_kernel(
         self,
@@ -875,7 +1252,6 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         mf: ti.i32,
         skip_seg_type: ti.i32,
     ):
-        h = self.ps.support_radius
         nseg = self.ss_seg.segment_num[None]
         for i in range(nseg):
             if self.ss_seg.active[i] != 1:
@@ -886,76 +1262,24 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 continue
             xm = self.ss_seg.x_minus[i]
             xp = self.ss_seg.x_plus[i]
-            wsum_m = 0.0
-            wsum_p = 0.0
-            if ti.static(self.ps.dim == 2):
-                vacc_m2 = ti.Vector([0.0, 0.0])
-                vacc_p2 = ti.Vector([0.0, 0.0])
-                for p in range(self.ps.particle_num[None]):
-                    if self.ps.material[p] != mf:
-                        continue
-                    rm = xm - self.ps.x[p]
-                    rnm = rm.norm()
-                    if rnm < h:
-                        mv_wm = self.ps.m_V[p] * self.cubic_kernel(rnm)
-                        vacc_m2 += mv_wm * self.ps.v[p]
-                        wsum_m += mv_wm
-                    rp = xp - self.ps.x[p]
-                    rnp = rp.norm()
-                    if rnp < h:
-                        mv_wp = self.ps.m_V[p] * self.cubic_kernel(rnp)
-                        vacc_p2 += mv_wp * self.ps.v[p]
-                        wsum_p += mv_wp
-                if wsum_m > 1e-12:
-                    v_target_m = scale * (vacc_m2 / wsum_m)
-                    self.seg_solver.sph_advect_velocity_minus[i] = (
-                        (1.0 - blend) * self.seg_solver.sph_advect_velocity_minus[i]
-                        + blend * v_target_m
-                    )
-                else:
-                    self.seg_solver.sph_advect_velocity_minus[i] *= (1.0 - blend)
-                if wsum_p > 1e-12:
-                    v_target_p = scale * (vacc_p2 / wsum_p)
-                    self.seg_solver.sph_advect_velocity_plus[i] = (
-                        (1.0 - blend) * self.seg_solver.sph_advect_velocity_plus[i]
-                        + blend * v_target_p
-                    )
-                else:
-                    self.seg_solver.sph_advect_velocity_plus[i] *= (1.0 - blend)
+            vacc_m, wsum_m = self._sample_sph_velocity_at_position_from_grid(xm, mf)
+            vacc_p, wsum_p = self._sample_sph_velocity_at_position_from_grid(xp, mf)
+            if wsum_m > 1e-12:
+                v_target_m = scale * (vacc_m / wsum_m)
+                self.seg_solver.sph_advect_velocity_minus[i] = (
+                    (1.0 - blend) * self.seg_solver.sph_advect_velocity_minus[i]
+                    + blend * v_target_m
+                )
             else:
-                vacc_m3 = ti.Vector([0.0, 0.0, 0.0])
-                vacc_p3 = ti.Vector([0.0, 0.0, 0.0])
-                for p in range(self.ps.particle_num[None]):
-                    if self.ps.material[p] != mf:
-                        continue
-                    rm = xm - self.ps.x[p]
-                    rnm = rm.norm()
-                    if rnm < h:
-                        mv_wm = self.ps.m_V[p] * self.cubic_kernel(rnm)
-                        vacc_m3 += mv_wm * self.ps.v[p]
-                        wsum_m += mv_wm
-                    rp = xp - self.ps.x[p]
-                    rnp = rp.norm()
-                    if rnp < h:
-                        mv_wp = self.ps.m_V[p] * self.cubic_kernel(rnp)
-                        vacc_p3 += mv_wp * self.ps.v[p]
-                        wsum_p += mv_wp
-                if wsum_m > 1e-12:
-                    v_target_m = scale * (vacc_m3 / wsum_m)
-                    self.seg_solver.sph_advect_velocity_minus[i] = (
-                        (1.0 - blend) * self.seg_solver.sph_advect_velocity_minus[i]
-                        + blend * v_target_m
-                    )
-                else:
-                    self.seg_solver.sph_advect_velocity_minus[i] *= (1.0 - blend)
-                if wsum_p > 1e-12:
-                    v_target_p = scale * (vacc_p3 / wsum_p)
-                    self.seg_solver.sph_advect_velocity_plus[i] = (
-                        (1.0 - blend) * self.seg_solver.sph_advect_velocity_plus[i]
-                        + blend * v_target_p
-                    )
-                else:
-                    self.seg_solver.sph_advect_velocity_plus[i] *= (1.0 - blend)
+                self.seg_solver.sph_advect_velocity_minus[i] *= (1.0 - blend)
+            if wsum_p > 1e-12:
+                v_target_p = scale * (vacc_p / wsum_p)
+                self.seg_solver.sph_advect_velocity_plus[i] = (
+                    (1.0 - blend) * self.seg_solver.sph_advect_velocity_plus[i]
+                    + blend * v_target_p
+                )
+            else:
+                self.seg_solver.sph_advect_velocity_plus[i] *= (1.0 - blend)
         for i in range(nseg, self.ss_seg.segment_max_num):
             self.seg_solver.sph_advect_velocity_minus[i] *= 0.0
             self.seg_solver.sph_advect_velocity_plus[i] *= 0.0
@@ -1127,7 +1451,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         return flat
 
     @ti.kernel
-    def _sync_vortex_ghost_particles_from_segments(self, skip_seg_type: ti.i32):
+    def _sync_vortex_ghost_particles_from_segments(self, skip_seg_type: ti.i32, copy_velocity: ti.i32):
         self.vortex_ghost_num[None] = 0
         for c in range(self.ps.flattened_grid_num):
             self.vortex_ghost_grid_count[c] = 0
@@ -1142,9 +1466,11 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 continue
             for d in ti.static(range(self.ps.dim)):
                 self.vortex_ghost_x[g][d] = 0.5 * (self.ss_seg.x_minus[i][d] + self.ss_seg.x_plus[i][d])
-                self.vortex_ghost_v[g][d] = 0.5 * (
-                    self.seg_solver.v_minus[i][d] + self.seg_solver.v_plus[i][d]
-                )
+                self.vortex_ghost_v[g][d] = 0.0
+                if copy_velocity != 0:
+                    self.vortex_ghost_v[g][d] = 0.5 * (
+                        self.seg_solver.v_minus[i][d] + self.seg_solver.v_plus[i][d]
+                    )
             self.vortex_ghost_mV[g] = self.seg_solver.point_vortex_volume[i]
             self.vortex_ghost_gamma[g] = self.ss_seg.gamma[i]
         if self.vortex_ghost_num[None] > self.ss_seg.segment_max_num:
@@ -1166,6 +1492,96 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             slot = ti.atomic_add(self.vortex_ghost_grid_count[flat], 1)
             if slot < ti.static(self._vortex_ghost_grid_capacity):
                 self.vortex_ghost_grid_indices[flat, slot] = g
+
+    @ti.kernel
+    def _compute_vortex_ghost_bs_velocity_for_fluid(self, mf: ti.i32, support_radius: float, reg_radius: float):
+        for p in range(self.ps.particle_max_num):
+            self.u_vortex_ghost_sph[p] *= 0.0
+        R2 = reg_radius * reg_radius
+        inv2pi = 1.0 / (2.0 * ti.math.pi)
+        normal_sign = self.seg_solver._bs_2d_normal_sign[None]
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.material[p] != mf:
+                continue
+            center_cell = self.ps.pos_to_index(self.ps.x[p])
+            u = ti.Vector([0.0 for _ in ti.static(range(self.ps.dim))])
+            for offset in ti.grouped(ti.ndrange(*((-1, 2),) * self.ps.dim)):
+                cell = center_cell + offset
+                valid = 1
+                for d in ti.static(range(self.ps.dim)):
+                    if cell[d] < 0 or cell[d] >= self.ps.grid_num[d]:
+                        valid = 0
+                if valid == 0:
+                    continue
+                flat = self._vortex_ghost_flatten_cell(cell)
+                if flat < 0 or flat >= self.ps.flattened_grid_num:
+                    continue
+                count = self.vortex_ghost_grid_count[flat]
+                if count > ti.static(self._vortex_ghost_grid_capacity):
+                    count = ti.static(self._vortex_ghost_grid_capacity)
+                for slot in range(count):
+                    g = self.vortex_ghost_grid_indices[flat, slot]
+                    r = self.ps.x[p] - self.vortex_ghost_x[g]
+                    rn = r.norm()
+                    if rn < support_radius:
+                        Gamma = self.vortex_ghost_gamma[g]
+                        if ti.static(self.ps.dim == 2):
+                            rx = r[0]
+                            ry = r[1]
+                            denom = rx * rx + ry * ry + R2 + 1e-12
+                            u[0] += normal_sign * inv2pi * Gamma * (-ry) / denom
+                            u[1] += normal_sign * inv2pi * Gamma * (rx) / denom
+                        else:
+                            for d in ti.static(range(self.ps.dim)):
+                                u[d] += 0.0
+            self.u_vortex_ghost_sph[p] = u
+
+    @ti.kernel
+    def _compute_vortex_ghost_velocity_for_fluid(self, mf: ti.i32, support_radius: float):
+        for p in range(self.ps.particle_max_num):
+            self.u_vortex_ghost_sph[p] *= 0.0
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.material[p] != mf:
+                continue
+            center_cell = self.ps.pos_to_index(self.ps.x[p])
+            v_acc = ti.Vector([0.0 for _ in ti.static(range(self.ps.dim))])
+            wsum = 0.0
+            for offset in ti.grouped(ti.ndrange(*((-1, 2),) * self.ps.dim)):
+                cell = center_cell + offset
+                valid = 1
+                for d in ti.static(range(self.ps.dim)):
+                    if cell[d] < 0 or cell[d] >= self.ps.grid_num[d]:
+                        valid = 0
+                if valid == 0:
+                    continue
+                flat = self._vortex_ghost_flatten_cell(cell)
+                if flat < 0 or flat >= self.ps.flattened_grid_num:
+                    continue
+                count = self.vortex_ghost_grid_count[flat]
+                if count > ti.static(self._vortex_ghost_grid_capacity):
+                    count = ti.static(self._vortex_ghost_grid_capacity)
+                for slot in range(count):
+                    g = self.vortex_ghost_grid_indices[flat, slot]
+                    r = self.ps.x[p] - self.vortex_ghost_x[g]
+                    rn = r.norm()
+                    if rn < support_radius:
+                        w = self.vortex_ghost_mV[g] * self._vortex_ghost_cubic_kernel(rn, support_radius)
+                        v_acc += w * self.vortex_ghost_v[g]
+                        wsum += w
+            if wsum > 1e-12:
+                self.u_vortex_ghost_sph[p] = v_acc / wsum
+
+    @ti.kernel
+    def _add_cached_vortex_ghost_velocity_to_fluid(self, beta: float, mf: ti.i32):
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.material[p] == mf:
+                self.ps.v[p] += beta * self.u_vortex_ghost_sph[p]
+
+    @ti.kernel
+    def _apply_cached_vortex_ghost_displacement_to_fluid(self, beta: float, mf: ti.i32):
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.material[p] == mf:
+                self.ps.x[p] += self.dt[None] * beta * self.u_vortex_ghost_sph[p]
 
     @ti.kernel
     def _add_vortex_ghost_velocity_to_fluid(self, beta: float, mf: ti.i32, support_radius: float):
@@ -1241,16 +1657,111 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             f"max|vorticity|={max_raw_norm:.6e}"
         )
 
+    def _debug_print_sph_ghost_velocity(self, stage: str, particle_id=None, v_before=None):
+        if not bool(self.seg_cfg.get_cfg("vortexGhostVelocityDebug", False)):
+            return
+        step = int(self.seg_solver._sim_step_index)
+        interval = max(1, int(self.seg_cfg.get_cfg("vortexGhostVelocityDebugInterval", 1)))
+        if step % interval != 0:
+            return
+        n = int(self.ps.particle_num[None])
+        if n <= 0:
+            return
+        p = particle_id
+        if p is None or int(p) < 0 or int(p) >= n:
+            cfg_p = self.seg_cfg.get_cfg("vortexGhostVelocityDebugParticle", None)
+            if cfg_p is not None:
+                p = int(cfg_p)
+            else:
+                p = int(self._debug_last_residual_particle)
+        if p is None or int(p) < 0 or int(p) >= n:
+            return
+        p = int(p)
+        x_p = self.ps.x.to_numpy()[p].astype(np.float64)
+        v_now = self.ps.v.to_numpy()[p].astype(np.float64)
+        support = float(self.ps.support_radius * self._vortex_ghost_support_radius_scale)
+        ng = int(self.vortex_ghost_num[None])
+        ghost_v = np.zeros((int(self.ps.dim),), dtype=np.float64)
+        wsum = 0.0
+        near_count = 0
+        if ng > 0:
+            xg = self.vortex_ghost_x.to_numpy()[:ng].astype(np.float64)
+            vg = self.vortex_ghost_v.to_numpy()[:ng].astype(np.float64)
+            mv = self.vortex_ghost_mV.to_numpy()[:ng].astype(np.float64)
+            r = x_p[: int(self.ps.dim)][None, :] - xg[:, : int(self.ps.dim)]
+            rn = np.linalg.norm(r, axis=1)
+            near = (rn < support) & np.isfinite(mv) & (mv > 0.0)
+            near_count = int(np.sum(near))
+            if near_count > 0:
+                w = mv[near] * self._cubic_kernel_np(rn[near], support)
+                wsum = float(np.sum(w))
+                if wsum > 1e-12:
+                    ghost_v = np.sum(w[:, None] * vg[near, : int(self.ps.dim)], axis=0) / wsum
+        beta = float(self._vortex_ghost_beta)
+        cached_v = self.u_vortex_ghost_sph.to_numpy()[p].astype(np.float64)[: int(self.ps.dim)]
+        velocity_source = str(
+            self.seg_cfg.get_cfg("vortexGhostFeedbackVelocitySource", "direct_bs")
+            or "direct_bs"
+        ).lower().strip()
+        if velocity_source in ("direct_bs", "bs", "gamma_bs", "point_vortex_bs") and self.seg_solver._bs_2d_point:
+            ghost_v = cached_v
+        beta_ghost = beta * ghost_v
+        before_s = ""
+        if v_before is not None:
+            vb = np.asarray(v_before, dtype=np.float64)[: int(self.ps.dim)]
+            dv = v_now[: int(self.ps.dim)] - vb
+            before_s = (
+                f" v_before=({float(vb[0]):.6e},{float(vb[1]):.6e})"
+                f" dv_actual=({float(dv[0]):.6e},{float(dv[1]):.6e})"
+            )
+        print(
+            f"[ghost-velocity-debug] step={step} stage={stage} particle={p} "
+            f"pos=({float(x_p[0]):.4f},{float(x_p[1]):.4f}) "
+            f"near_ghost={near_count} wsum={wsum:.6e} beta={beta:.6e} "
+            f"ghost_v=({float(ghost_v[0]):.6e},{float(ghost_v[1]):.6e}) "
+            f"beta_ghost=({float(beta_ghost[0]):.6e},{float(beta_ghost[1]):.6e}) "
+            f"sph_v=({float(v_now[0]):.6e},{float(v_now[1]):.6e})"
+            f"{before_s}"
+        )
+
     def _apply_segment_feedback_to_sph(self):
         if self._vortex_ghost_feedback:
             skip_type = int(self._vortex_ghost_skip_type if self._vortex_ghost_skip_boundary else -1)
-            self._sync_vortex_ghost_particles_from_segments(skip_type)
-            self._build_vortex_ghost_grid()
-            self._add_vortex_ghost_velocity_to_fluid(
-                float(self._vortex_ghost_beta),
-                int(self.ps.material_fluid),
-                float(self.ps.support_radius * self._vortex_ghost_support_radius_scale),
+            velocity_source = str(
+                self.seg_cfg.get_cfg("vortexGhostFeedbackVelocitySource", "direct_bs")
+                or "direct_bs"
+            ).lower().strip()
+            direct_bs_source = (
+                velocity_source in ("direct_bs", "bs", "gamma_bs", "point_vortex_bs")
+                and self.seg_solver._bs_2d_point
             )
+            copy_ghost_velocity = 0 if direct_bs_source else 1
+            self._sync_vortex_ghost_particles_from_segments(skip_type, copy_ghost_velocity)
+            self._build_vortex_ghost_grid()
+            v_before = None
+            dbg_p = int(self._debug_last_residual_particle)
+            support = float(self.ps.support_radius * self._vortex_ghost_support_radius_scale)
+            if direct_bs_source:
+                self._compute_vortex_ghost_bs_velocity_for_fluid(
+                    int(self.ps.material_fluid), support, float(self.seg_solver.reg_radius)
+                )
+            else:
+                self._compute_vortex_ghost_velocity_for_fluid(
+                    int(self.ps.material_fluid), support
+                )
+            if bool(self.seg_cfg.get_cfg("vortexGhostVelocityDebug", False)) and dbg_p >= 0:
+                n_dbg = int(self.ps.particle_num[None])
+                if dbg_p < n_dbg:
+                    v_before = self.ps.v.to_numpy()[dbg_p].copy()
+                    self._debug_print_sph_ghost_velocity("before_feedback", dbg_p)
+            if self._vortex_ghost_velocity_feedback:
+                self._add_cached_vortex_ghost_velocity_to_fluid(
+                    float(self._vortex_ghost_beta), int(self.ps.material_fluid)
+                )
+                if v_before is not None:
+                    self._debug_print_sph_ghost_velocity("after_feedback", dbg_p, v_before=v_before)
+            else:
+                self._debug_print_sph_ghost_velocity("cached_displacement_feedback", dbg_p)
             if self._one_step_vortex_impulse:
                 self._clear_one_step_internal_point_vortices()
         elif self._feedback_mode in ("bs_direct", "direct_bs", "biot_savart", "bs"):
@@ -1265,25 +1776,66 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 int(self.ps.material_fluid),
             )
 
+    def _apply_vortex_ghost_displacement_feedback(self):
+        if not self._vortex_ghost_displacement_feedback:
+            return
+        self._apply_cached_vortex_ghost_displacement_to_fluid(
+            float(self._vortex_ghost_beta), int(self.ps.material_fluid)
+        )
+        self._debug_print_sph_ghost_velocity(
+            "after_displacement", int(self._debug_last_residual_particle)
+        )
+
     def substep(self):
-        self.compute_densities()
-        self.compute_DFSPH_factor()
-        self.divergence_solve()
-        self.compute_non_pressure_forces()
+        timing = self._substep_timing_enabled and (
+            int(self.seg_solver._sim_step_index) % self._substep_timing_interval == 0
+        )
+        records = []
 
-        self.predict_velocity()
+        def sync_if_needed():
+            if timing and self._substep_timing_sync:
+                ti.sync()
 
-        self.compute_vorticity()
-        self.compute_vorticity_vis()
-        self._print_sph_vorticity_debug()
-        self._advance_segments_coupled()
-        self._apply_segment_feedback_to_sph()
+        def run_stage(name, fn):
+            if not timing:
+                fn()
+                return
+            sync_if_needed()
+            t0 = time.perf_counter()
+            fn()
+            sync_if_needed()
+            records.append((name, (time.perf_counter() - t0) * 1000.0))
 
-        self.pressure_solve()
-        self.compute_vorticity()
-        self.compute_vorticity_vis()
-        self.copy_x_temp()
-        self.advect()
+        run_stage("compute_densities", self.compute_densities)
+        run_stage("compute_DFSPH_factor", self.compute_DFSPH_factor)
+        run_stage("divergence_solve", self.divergence_solve)
+        run_stage("compute_non_pressure_forces", self.compute_non_pressure_forces)
+        run_stage("predict_velocity", self.predict_velocity)
+        run_stage("compute_vorticity_pre", self.compute_vorticity)
+        run_stage("compute_vorticity_vis_pre", self.compute_vorticity_vis)
+        run_stage("print_sph_vorticity_debug", self._print_sph_vorticity_debug)
+        run_stage("advance_segments_coupled", self._advance_segments_coupled)
+        run_stage("apply_segment_feedback_to_sph", self._apply_segment_feedback_to_sph)
+        run_stage("pressure_solve", self.pressure_solve)
+        run_stage(
+            "ghost_velocity_debug_after_pressure",
+            lambda: self._debug_print_sph_ghost_velocity(
+                "after_pressure", int(self._debug_last_residual_particle)
+            ),
+        )
+        run_stage("compute_vorticity_post", self.compute_vorticity)
+        run_stage("compute_vorticity_vis_post", self.compute_vorticity_vis)
+        run_stage("copy_x_temp", self.copy_x_temp)
+        run_stage("advect", self.advect)
+        run_stage("apply_vortex_ghost_displacement", self._apply_vortex_ghost_displacement_feedback)
+
+        if timing:
+            total = sum(v for _, v in records)
+            parts = " ".join(f"{name}={ms:.3f}ms" for name, ms in records)
+            print(
+                f"[hybrid-substep-timing] step={int(self.seg_solver._sim_step_index)} "
+                f"total={total:.3f}ms {parts}"
+            )
 
     @ti.kernel
     def _compute_segment_center_vort_vis_z(self, mf: ti.i32):
@@ -1448,6 +2000,65 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             zorder=9,
         )
 
+    def _add_sph_ghost_bs_velocity_overlay_2d(self, ax):
+        if not bool(self.seg_cfg.get_cfg("imageShowSphGhostBsVelocityArrows", False)):
+            return
+        n = int(self.ps.particle_num[None])
+        if n <= 0:
+            return
+        material = self.ps.material.to_numpy()[:n]
+        fluid = material == int(self.ps.material_fluid)
+        if not np.any(fluid):
+            return
+        x = self.x_temp.to_numpy()[:n]
+        u = self.u_vortex_ghost_sph.to_numpy()[:n]
+        x = x[fluid, :2].astype(np.float64, copy=False)
+        u = u[fluid, :2].astype(np.float64, copy=False)
+        speed = np.linalg.norm(u, axis=1)
+        min_speed = float(self.seg_cfg.get_cfg("imageSphGhostBsArrowMinSpeed", 1e-8))
+        valid = np.isfinite(x[:, 0]) & np.isfinite(x[:, 1]) & np.isfinite(speed) & (speed > min_speed)
+        if not np.any(valid):
+            return
+        x = x[valid]
+        u = u[valid]
+        speed = speed[valid]
+        stride = max(1, int(self.seg_cfg.get_cfg("imageSphGhostBsArrowStride", 16)))
+        if stride > 1:
+            x = x[::stride]
+            u = u[::stride]
+            speed = speed[::stride]
+        max_count = int(self.seg_cfg.get_cfg("imageSphGhostBsArrowMaxCount", 2500))
+        if max_count > 0 and x.shape[0] > max_count:
+            ids = np.linspace(0, x.shape[0] - 1, max_count).astype(np.int64)
+            x = x[ids]
+            u = u[ids]
+            speed = speed[ids]
+        if x.shape[0] == 0:
+            return
+        arrow_len = float(self.seg_cfg.get_cfg("imageSphGhostBsArrowLength", 0.025))
+        scale_by_speed = bool(self.seg_cfg.get_cfg("imageSphGhostBsArrowScaleBySpeed", False))
+        dirs = u / (speed[:, None] + 1e-12)
+        lengths = np.full_like(speed, arrow_len)
+        if scale_by_speed:
+            ref = float(self.seg_cfg.get_cfg("imageSphGhostBsArrowSpeedRef", np.percentile(speed, 90)))
+            if ref <= 1e-12:
+                ref = 1.0
+            lengths = arrow_len * np.minimum(speed / ref, 2.0)
+        vec = dirs * lengths[:, None]
+        ax.quiver(
+            x[:, 0],
+            x[:, 1],
+            vec[:, 0],
+            vec[:, 1],
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            color=self._parse_rgb_cfg("imageSphGhostBsArrowColor", [0, 255, 0]),
+            alpha=float(self.seg_cfg.get_cfg("imageSphGhostBsArrowAlpha", 0.85)),
+            width=float(self.seg_cfg.get_cfg("imageSphGhostBsArrowWidth", 0.0015)),
+            zorder=10,
+        )
+
     def _export_vortex_ghost_png_2d(self, cnt: int, dir_ghost: Path, ds, de):
         if not self._export_ghost_panel:
             return
@@ -1520,6 +2131,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                         zorder=2,
                     )
         self._add_vortex_ghost_overlay_2d(ax, force=True)
+        self._add_sph_ghost_bs_velocity_overlay_2d(ax)
         ax.set_xlim(float(ds[0]), float(de[0]))
         ax.set_ylim(float(ds[1]), float(de[1]))
         ax.set_aspect("equal", adjustable="box")
@@ -1902,16 +2514,6 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 xm = self.ss_seg.x_minus.to_numpy()[:n_seg]
                 xp = self.ss_seg.x_plus.to_numpy()[:n_seg]
                 idx_int, idx_bnd = self._active_segment_index_groups(n_seg)
-                btype = int(self.seg_cfg.get_cfg("boundarySegmentTypeId", 2))
-                st = self.ss_seg.seg_type.to_numpy()[:n_seg]
-                act = self.ss_seg.active.to_numpy()[:n_seg]
-                # 若类型标记异常，仍把全部活跃段按边界色绘制
-                if idx_bnd.size == 0 and int(np.sum(act == 1)) > 0:
-                    idx_all = np.nonzero(act == 1)[0]
-                    if int(np.sum(st[idx_all] == btype)) == 0:
-                        idx_bnd = idx_all
-                    elif int(np.sum(st[idx_all] == btype)) > 0:
-                        idx_bnd = idx_all[st[idx_all] == btype]
                 if idx_int.size > 0:
                     gamma_values = self.ss_seg.gamma.to_numpy()[:n_seg]
                     scalars = gamma_values[idx_int].astype(np.float64)
