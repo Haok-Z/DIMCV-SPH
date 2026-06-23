@@ -29,6 +29,54 @@ class KarmanVortexSolver(DIMCVSPHSolver):
                 self.circle_pos[0] * 0.25, self.circle_pos[1], self.circle_pos[2]
             ])
         self.init_cylinder()
+        cfg_dict = getattr(self.ps.cfg, "config", {}).get("Configuration", {})
+
+        def cfg_get(name, default=None):
+            return cfg_dict.get(name, default)
+        self._emit_stop_step = cfg_get("emitStopStep", None)
+        self._emit_stop_time = cfg_get("emitStopTime", None)
+        self._emit_stop_fluid_particle_num = cfg_get("emitStopFluidParticleNum", None)
+        self._cylinder_motion_mode = str(
+            cfg_get("cylinderMotionMode", "oscillation") or "oscillation"
+        ).lower().strip()
+        self._cylinder_oscillation_enabled = bool(
+            cfg_get("cylinderOscillationEnabled", False)
+        )
+        self._cylinder_oscillation_object_id = int(
+            cfg_get("cylinderOscillationObjectId", 2)
+        )
+        self._cylinder_oscillation_axis = np.asarray(
+            cfg_get("cylinderOscillationAxis", [1.0, 0.0]), dtype=np.float64
+        ).reshape(-1)
+        if self._cylinder_oscillation_axis.size < self.ps.dim:
+            self._cylinder_oscillation_axis = np.pad(
+                self._cylinder_oscillation_axis,
+                (0, self.ps.dim - self._cylinder_oscillation_axis.size),
+                constant_values=0.0,
+            )
+        self._cylinder_oscillation_axis = self._cylinder_oscillation_axis[: self.ps.dim]
+        axis_norm = np.linalg.norm(self._cylinder_oscillation_axis)
+        if axis_norm > 1e-12:
+            self._cylinder_oscillation_axis = self._cylinder_oscillation_axis / axis_norm
+        self._cylinder_oscillation_amplitude = float(
+            cfg_get("cylinderOscillationAmplitude", 0.0)
+        )
+        self._cylinder_oscillation_period = max(
+            1e-12, float(cfg_get("cylinderOscillationPeriod", 1.0))
+        )
+        self._cylinder_oscillation_start_time = float(
+            cfg_get("cylinderOscillationStartTime", 0.0)
+        )
+        self._cylinder_linear_velocity = np.asarray(
+            cfg_get("cylinderLinearVelocity", [0.0, 0.0]), dtype=np.float64
+        ).reshape(-1)
+        if self._cylinder_linear_velocity.size < self.ps.dim:
+            self._cylinder_linear_velocity = np.pad(
+                self._cylinder_linear_velocity,
+                (0, self.ps.dim - self._cylinder_linear_velocity.size),
+                constant_values=0.0,
+            )
+        self._cylinder_linear_velocity = self._cylinder_linear_velocity[: self.ps.dim]
 
     @ti.kernel
     def init_circle(self):
@@ -50,6 +98,83 @@ class KarmanVortexSolver(DIMCVSPHSolver):
                     for d in ti.static(range(self.ps.dim)):
                         self.ps.x[p][d] = 0.0
                     self.ps.is_active[p] = 0
+
+    @ti.kernel
+    def _translate_object_from_rest_kernel(
+        self, object_id: ti.i32, off0: float, off1: float, off2: float, vel0: float, vel1: float, vel2: float
+    ):
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.object_id[p] == object_id:
+                dx = self.ps.x_0[p][0] - self.circle_pos[0]
+                dy = self.ps.x_0[p][1] - self.circle_pos[1]
+                inside_circle = ti.sqrt(dx * dx + dy * dy) <= self.circle_radius
+                if inside_circle:
+                    self.ps.is_active[p] = 1
+                    self.ps.x[p] = self.ps.x_0[p] + ti.Vector([off0, off1])
+                    self.ps.v[p] = ti.Vector([vel0, vel1])
+                else:
+                    self.ps.x[p] = self.ps.x_0[p] + ti.Vector([off0, off1, off2])
+                    self.ps.v[p] = ti.Vector([vel0, vel1, vel2])
+
+    @ti.kernel
+    def _translate_object_from_rest_kernel(
+        self, object_id: ti.i32, off0: float, off1: float, off2: float, vel0: float, vel1: float, vel2: float
+    ):
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.object_id[p] == object_id:
+                dx = self.ps.x_0[p][0] - self.circle_pos[0]
+                dy = self.ps.x_0[p][1] - self.circle_pos[1]
+                inside_circle = ti.sqrt(dx * dx + dy * dy) <= self.circle_radius
+                if inside_circle:
+                    self.ps.is_active[p] = 1
+                    if ti.static(self.ps.dim == 2):
+                        self.ps.x[p] = self.ps.x_0[p] + ti.Vector([off0, off1])
+                        self.ps.v[p] = ti.Vector([vel0, vel1])
+                    else:
+                        self.ps.x[p] = self.ps.x_0[p] + ti.Vector([off0, off1, off2])
+                        self.ps.v[p] = ti.Vector([vel0, vel1, vel2])
+                else:
+                    self.ps.is_active[p] = 0
+                    for d in ti.static(range(self.ps.dim)):
+                        self.ps.x[p][d] = 0.0
+                        self.ps.v[p][d] = 0.0
+
+    def _should_emit_this_step(self) -> bool:
+        if self._emit_stop_step is not None and int(self.cnt) >= int(self._emit_stop_step):
+            return False
+        if self._emit_stop_fluid_particle_num is not None:
+            if int(self.ps.fluid_particle_num[None]) >= int(self._emit_stop_fluid_particle_num):
+                return False
+        if self._emit_stop_time is not None:
+            t = float(self.cnt) * float(self.dt[None])
+            if t >= float(self._emit_stop_time):
+                return False
+        return True
+
+    def _update_oscillating_cylinder(self):
+        if not self._cylinder_oscillation_enabled:
+            return
+        t = float(self.cnt) * float(self.dt[None])
+        if t < self._cylinder_oscillation_start_time:
+            return
+        tau = t - self._cylinder_oscillation_start_time
+        if self._cylinder_motion_mode in ("linear", "translate", "translation"):
+            offset = tau * self._cylinder_linear_velocity
+            vel = self._cylinder_linear_velocity
+        else:
+            omega = 2.0 * np.pi / self._cylinder_oscillation_period
+            amp = self._cylinder_oscillation_amplitude
+            offset = amp * np.sin(omega * tau) * self._cylinder_oscillation_axis
+            vel = amp * omega * np.cos(omega * tau) * self._cylinder_oscillation_axis
+        off3 = np.zeros((3,), dtype=np.float64)
+        vel3 = np.zeros((3,), dtype=np.float64)
+        off3[: self.ps.dim] = offset[: self.ps.dim]
+        vel3[: self.ps.dim] = vel[: self.ps.dim]
+        self._translate_object_from_rest_kernel(
+            self._cylinder_oscillation_object_id,
+            float(off3[0]), float(off3[1]), float(off3[2]),
+            float(vel3[0]), float(vel3[1]), float(vel3[2]),
+        )
 
     def export_png(self, cnt, image_path):
         N = self.ps.particle_num[None]
@@ -292,11 +417,18 @@ class KarmanVortexSolver(DIMCVSPHSolver):
     def step(self):
         # Cull out-of-domain fluid and compact first so emit sees freed slots.
         self.ps.initialize_particle_system()
-        if self.cnt % self.emit_interval == 0:
+        if self._cylinder_oscillation_enabled:
+            self._translate_object_from_rest_kernel(
+                self._cylinder_oscillation_object_id,
+                0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+            )
+        if self.cnt % self.emit_interval == 0 and self._should_emit_this_step():
             self.dump_num_particles_each_emitters_ti2np()
             self.emit_particle()
             self.dump_num_particles_each_emitters_np2ti()
             self.ps.rebuild_neighbor_grid()
+        self._update_oscillating_cylinder()
         self.cnt += 1
         self.compute_moving_boundary_volume()
         if int(self.ps.fluid_particle_num[None]) <= 0:

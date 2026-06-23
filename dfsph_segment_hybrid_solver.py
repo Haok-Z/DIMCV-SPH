@@ -157,6 +157,14 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             "velocity_ghost",
             "ghost",
         )
+        self._vortex_ghost_replace_velocity_feedback = self._feedback_mode in (
+            "vortex_ghost_replace_velocity",
+            "ghost_replace_velocity",
+            "replace_vortex_ghost_velocity",
+            "replace_ghost_velocity",
+            "vortex_ghost_velocity_replace",
+            "ghost_velocity_replace",
+        )
         self._vortex_ghost_displacement_feedback = self._feedback_mode in (
             "vortex_ghost_displacement",
             "ghost_displacement",
@@ -165,6 +173,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         )
         self._vortex_ghost_feedback = (
             self._vortex_ghost_velocity_feedback
+            or self._vortex_ghost_replace_velocity_feedback
             or self._vortex_ghost_displacement_feedback
         )
         self._vortex_ghost_beta = float(
@@ -522,10 +531,35 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionRegion", "circle_band")
             or "circle_band"
         ).lower().strip()
+        base_mask = fluid_mask & (threshold_mag >= np.float32(threshold))
         if region in ("all", "global", "whole_domain", "domain", "anywhere"):
-            mask = fluid_mask & (threshold_mag >= np.float32(threshold))
+            mask = base_mask
+        elif region in ("box", "aabb", "rect", "rectangle", "injection_box", "generation_box"):
+            dim = int(self.ps.dim)
+            box_start = np.asarray(
+                self.seg_cfg.get_cfg(
+                    "sphBoundaryVorticityInjectionDomainStart",
+                    self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionBoxStart", self.ss_seg.domain_start),
+                ),
+                dtype=np.float32,
+            ).reshape(-1)
+            box_end = np.asarray(
+                self.seg_cfg.get_cfg(
+                    "sphBoundaryVorticityInjectionDomainEnd",
+                    self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionBoxEnd", self.ss_seg.domain_end),
+                ),
+                dtype=np.float32,
+            ).reshape(-1)
+            if box_start.size < dim:
+                box_start = np.pad(box_start, (0, dim - box_start.size), constant_values=-np.inf)
+            if box_end.size < dim:
+                box_end = np.pad(box_end, (0, dim - box_end.size), constant_values=np.inf)
+            lo = np.minimum(box_start[:dim], box_end[:dim])
+            hi = np.maximum(box_start[:dim], box_end[:dim])
+            in_box = np.all((x[:, :dim] >= lo[None, :]) & (x[:, :dim] <= hi[None, :]), axis=1)
+            mask = base_mask & in_box
         else:
-            mask = fluid_mask & (signed_dist >= 0.0) & (signed_dist <= np.float32(band)) & (threshold_mag >= np.float32(threshold))
+            mask = base_mask & (signed_dist >= 0.0) & (signed_dist <= np.float32(band))
         idx = np.nonzero(mask)[0]
         if idx.size == 0:
             return
@@ -1578,6 +1612,17 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 self.ps.v[p] += beta * self.u_vortex_ghost_sph[p]
 
     @ti.kernel
+    def _replace_fluid_velocity_with_cached_vortex_ghost_velocity(
+        self, beta: float, mf: ti.i32, min_speed: float
+    ):
+        min_speed2 = min_speed * min_speed
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.material[p] == mf:
+                u = self.u_vortex_ghost_sph[p]
+                if u.dot(u) > min_speed2:
+                    self.ps.v[p] = beta * u
+
+    @ti.kernel
     def _apply_cached_vortex_ghost_displacement_to_fluid(self, beta: float, mf: ti.i32):
         for p in range(self.ps.particle_num[None]):
             if self.ps.material[p] == mf:
@@ -1675,7 +1720,16 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             else:
                 p = int(self._debug_last_residual_particle)
         if p is None or int(p) < 0 or int(p) >= n:
-            return
+            mat = self.ps.material.to_numpy()[:n]
+            fluid = mat == int(self.ps.material_fluid)
+            if not np.any(fluid):
+                return
+            u_all = self.u_vortex_ghost_sph.to_numpy()[:n].astype(np.float64)
+            speed = np.linalg.norm(u_all[:, : int(self.ps.dim)], axis=1)
+            speed[~fluid] = -1.0
+            p = int(np.argmax(speed))
+            if speed[p] <= 0.0:
+                p = int(np.nonzero(fluid)[0][0])
         p = int(p)
         x_p = self.ps.x.to_numpy()[p].astype(np.float64)
         v_now = self.ps.v.to_numpy()[p].astype(np.float64)
@@ -1706,6 +1760,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         if velocity_source in ("direct_bs", "bs", "gamma_bs", "point_vortex_bs") and self.seg_solver._bs_2d_point:
             ghost_v = cached_v
         beta_ghost = beta * ghost_v
+        dx_ghost = float(self.dt[None]) * beta_ghost
         before_s = ""
         if v_before is not None:
             vb = np.asarray(v_before, dtype=np.float64)[: int(self.ps.dim)]
@@ -1720,6 +1775,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             f"near_ghost={near_count} wsum={wsum:.6e} beta={beta:.6e} "
             f"ghost_v=({float(ghost_v[0]):.6e},{float(ghost_v[1]):.6e}) "
             f"beta_ghost=({float(beta_ghost[0]):.6e},{float(beta_ghost[1]):.6e}) "
+            f"dx_ghost=({float(dx_ghost[0]):.6e},{float(dx_ghost[1]):.6e}) "
             f"sph_v=({float(v_now[0]):.6e},{float(v_now[1]):.6e})"
             f"{before_s}"
         )
@@ -1760,6 +1816,15 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 )
                 if v_before is not None:
                     self._debug_print_sph_ghost_velocity("after_feedback", dbg_p, v_before=v_before)
+            elif self._vortex_ghost_replace_velocity_feedback:
+                min_replace_speed = float(
+                    self.seg_cfg.get_cfg("vortexGhostReplaceVelocityMinSpeed", 1e-12)
+                )
+                self._replace_fluid_velocity_with_cached_vortex_ghost_velocity(
+                    float(self._vortex_ghost_beta), int(self.ps.material_fluid), min_replace_speed
+                )
+                if v_before is not None:
+                    self._debug_print_sph_ghost_velocity("after_replace_feedback", dbg_p, v_before=v_before)
             else:
                 self._debug_print_sph_ghost_velocity("cached_displacement_feedback", dbg_p)
             if self._one_step_vortex_impulse:

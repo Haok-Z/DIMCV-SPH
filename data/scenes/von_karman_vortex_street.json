@@ -23,6 +23,8 @@
         "windowRes": [2048,512],
 		"divergenceTransitArea": [0.0,0.02],
 		"invisibleObjects":[1,2],
+		"exportPLY": true,
+		"exportPLYAxisConvention": "xy",
         "imageVorticityAutoScale": false,
         "imageVorticityVmin": -40,
         "imageVorticityVmax": 40,
