@@ -288,6 +288,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self._segment_timing_interval = max(
             1, int(self.seg_cfg.get_cfg("debugSegmentAdvanceTimingInterval", self._substep_timing_interval))
         )
+        self._gpu_vorticity_injection_count = ti.field(dtype=ti.i32, shape=())
 
     def initialize(self):
         super().initialize()
@@ -356,6 +357,30 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             empty_x = np.zeros((0, dim), dtype=np.float32)
             empty_1 = np.zeros((0,), dtype=np.float32)
             return empty_x, empty_1, empty_1, empty_x
+        centers, gamma, volume, idx = self._active_point_vortex_gamma_arrays()
+        if idx.size == 0:
+            empty_x = np.zeros((0, dim), dtype=np.float32)
+            empty_1 = np.zeros((0,), dtype=np.float32)
+            return empty_x, empty_1, empty_1, empty_x
+        vm = self.seg_solver.v_minus.to_numpy()[:nseg, :dim]
+        vp = self.seg_solver.v_plus.to_numpy()[:nseg, :dim]
+        vel = (0.5 * (vm[idx] + vp[idx])).astype(np.float32)
+        return centers, gamma, volume, vel
+
+    def _active_point_vortex_gamma_arrays(self):
+        """Return active point-vortex center/gamma/volume arrays without velocity copies.
+
+        The residual-vorticity injection path only needs gamma-derived omega.
+        Avoiding v_minus/v_plus to_numpy() removes two GPU->CPU transfers from
+        the hot path. The returned ``idx`` maps rows back to segment indices.
+        """
+        nseg = int(self.ss_seg.segment_num[None])
+        dim = int(self.ps.dim)
+        if nseg <= 0:
+            empty_x = np.zeros((0, dim), dtype=np.float32)
+            empty_1 = np.zeros((0,), dtype=np.float32)
+            empty_i = np.zeros((0,), dtype=np.int64)
+            return empty_x, empty_1, empty_1, empty_i
         active = self.ss_seg.active.to_numpy()[:nseg] == 1
         seg_type = self.ss_seg.seg_type.to_numpy()[:nseg]
         skip_type = int(self._vortex_ghost_skip_type if self._vortex_ghost_skip_boundary else -999999)
@@ -365,39 +390,65 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         if idx.size == 0:
             empty_x = np.zeros((0, dim), dtype=np.float32)
             empty_1 = np.zeros((0,), dtype=np.float32)
-            return empty_x, empty_1, empty_1, empty_x
+            empty_i = np.zeros((0,), dtype=np.int64)
+            return empty_x, empty_1, empty_1, empty_i
         xm = self.ss_seg.x_minus.to_numpy()[:nseg, :dim]
         xp = self.ss_seg.x_plus.to_numpy()[:nseg, :dim]
         centers = (0.5 * (xm[idx] + xp[idx])).astype(np.float32)
         gamma = self.ss_seg.gamma.to_numpy()[:nseg][idx].astype(np.float32)
         volume = self.seg_solver.point_vortex_volume.to_numpy()[:nseg][idx].astype(np.float32)
-        vm = self.seg_solver.v_minus.to_numpy()[:nseg, :dim]
-        vp = self.seg_solver.v_plus.to_numpy()[:nseg, :dim]
-        vel = (0.5 * (vm[idx] + vp[idx])).astype(np.float32)
-        return centers, gamma, volume, vel
+        return centers, gamma, volume, idx
 
     def _estimate_vortex_omega_from_gamma_at_points(self, points, support_radius: float):
         pts = np.asarray(points, dtype=np.float32)
         out = np.zeros((pts.shape[0], 3), dtype=np.float32)
-        centers, gamma, volume, _ = self._active_point_vortex_arrays()
+        centers, gamma, volume, _ = self._active_point_vortex_gamma_arrays()
         if pts.size == 0 or centers.shape[0] == 0:
             return out
         valid = np.isfinite(gamma) & np.isfinite(volume) & (volume > 1e-12)
         if not np.any(valid):
             return out
-        centers = centers[valid]
-        gamma = gamma[valid].astype(np.float64)
-        volume = volume[valid].astype(np.float64)
-        for i, p in enumerate(pts[:, : centers.shape[1]]):
-            r = p[None, :] - centers
+        centers = centers[valid].astype(np.float64, copy=False)
+        gamma = gamma[valid].astype(np.float64, copy=False)
+        volume = volume[valid].astype(np.float64, copy=False)
+        support = float(support_radius)
+        if support <= 1e-12:
+            return out
+
+        dim = centers.shape[1]
+        inv_h = 1.0 / support
+        cell = np.floor(centers * inv_h).astype(np.int32)
+        buckets = {}
+        for j, key_arr in enumerate(cell):
+            key = tuple(int(v) for v in key_arr)
+            buckets.setdefault(key, []).append(j)
+
+        ranges = [(-1, 0, 1)] * dim
+        for i, p in enumerate(pts[:, :dim].astype(np.float64, copy=False)):
+            pc = np.floor(p * inv_h).astype(np.int32)
+            neigh = []
+            if dim == 2:
+                for ox in ranges[0]:
+                    for oy in ranges[1]:
+                        neigh.extend(buckets.get((int(pc[0] + ox), int(pc[1] + oy)), ()))
+            else:
+                for ox in ranges[0]:
+                    for oy in ranges[1]:
+                        for oz in ranges[2]:
+                            neigh.extend(buckets.get((int(pc[0] + ox), int(pc[1] + oy), int(pc[2] + oz)), ()))
+            if not neigh:
+                continue
+            neigh = np.asarray(neigh, dtype=np.int64)
+            r = p[None, :] - centers[neigh]
             rn = np.linalg.norm(r, axis=1)
-            near = rn < float(support_radius)
+            near = rn < support
             if not np.any(near):
                 continue
-            w = self._cubic_kernel_np(rn[near], support_radius)
-            wsum = float(np.sum(volume[near] * w))
+            ids = neigh[near]
+            w = self._cubic_kernel_np(rn[near], support)
+            wsum = float(np.sum(volume[ids] * w))
             if wsum > 1e-12:
-                out[i, 2] = float(np.sum(w * gamma[near]) / wsum)
+                out[i, 2] = float(np.sum(w * gamma[ids]) / wsum)
         return out
 
     def _estimate_vortex_omega_from_velocity_curl_at_points(self, points, support_radius: float):
@@ -444,6 +495,9 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         if int(self.ss_seg.dim) != int(self.ps.dim):
             return
 
+        if self._try_inject_segments_from_sph_boundary_vorticity_gpu_fast_path():
+            return
+
         n = int(self.ps.particle_num[None])
         if n <= 0:
             return
@@ -481,26 +535,29 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionThresholdSource", vort_src)
             or vort_src
         ).lower().strip()
-        if threshold_src in ("vorticity_loss", "loss", "d_vort", "vorticity_loss_pred", "loss_pred", "vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed") and not vort_src in ("vorticity_loss", "loss", "d_vort", "vorticity_loss_pred", "loss_pred", "vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
-            self.compute_v_star()
-            self.compute_vorticity()
-            self.compute_grad_v()
-            if threshold_src in ("vorticity_loss_pred", "loss_pred"):
-                self.compute_vorticity_pred()
-                self.compute_d_vorticity_pred()
-            else:
-                self.compute_d_vorticity()
-            if threshold_src in ("vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
-                self.compute_all_d_vort_smoothed()
-        if threshold_src in ("vis", "vorticity_vis", "smoothed", "smooth"):
-            threshold_vort = self.ps.vorticity_vis.to_numpy()[:n].astype(np.float32, copy=False)
-        elif threshold_src in ("vorticity_loss", "loss", "d_vort", "vorticity_loss_pred", "loss_pred"):
-            threshold_vort = self.d_vort.to_numpy()[:n].astype(np.float32, copy=False)
-        elif threshold_src in ("vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
-            threshold_vort = self.d_vort_smoothed.to_numpy()[:n].astype(np.float32, copy=False)
+        if threshold_src == vort_src:
+            threshold_vort = vort
         else:
-            threshold_vort = self.ps.vorticity.to_numpy()[:n].astype(np.float32, copy=False)
-        vel = self.ps.v.to_numpy()[:n].astype(np.float32, copy=False)
+            if threshold_src in ("vorticity_loss", "loss", "d_vort", "vorticity_loss_pred", "loss_pred", "vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed") and not vort_src in ("vorticity_loss", "loss", "d_vort", "vorticity_loss_pred", "loss_pred", "vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
+                self.compute_v_star()
+                self.compute_vorticity()
+                self.compute_grad_v()
+                if threshold_src in ("vorticity_loss_pred", "loss_pred"):
+                    self.compute_vorticity_pred()
+                    self.compute_d_vorticity_pred()
+                else:
+                    self.compute_d_vorticity()
+                if threshold_src in ("vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
+                    self.compute_all_d_vort_smoothed()
+            if threshold_src in ("vis", "vorticity_vis", "smoothed", "smooth"):
+                threshold_vort = self.ps.vorticity_vis.to_numpy()[:n].astype(np.float32, copy=False)
+            elif threshold_src in ("vorticity_loss", "loss", "d_vort", "vorticity_loss_pred", "loss_pred"):
+                threshold_vort = self.d_vort.to_numpy()[:n].astype(np.float32, copy=False)
+            elif threshold_src in ("vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
+                threshold_vort = self.d_vort_smoothed.to_numpy()[:n].astype(np.float32, copy=False)
+            else:
+                threshold_vort = self.ps.vorticity.to_numpy()[:n].astype(np.float32, copy=False)
+        vel = None
         mv = self.ps.m_V.to_numpy()[:n].astype(np.float32, copy=False)
         center_cfg = self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionCircleCenter", None)
         if center_cfg is None:
@@ -668,6 +725,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             elif orientation in ("omega", "vorticity", "vorticity_direction") and dim == 2:
                 tangent[:, 0] = 1.0
             else:
+                if vel is None:
+                    vel = self.ps.v.to_numpy()[:n].astype(np.float32, copy=False)
                 tangent[:, :2] = vel[idx, :2].astype(np.float32, copy=True)
                 tn = np.linalg.norm(tangent[:, :2], axis=1, keepdims=True)
                 weak = tn[:, 0] < 1e-8
@@ -716,8 +775,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             or "omega_dot_t"
         ).lower().strip()
         gamma_omega_z = gamma_source_vort[:, 2]
-        gamma_omega_mag = np.linalg.norm(gamma_source_vort, axis=1).astype(np.float32)
         if gamma_mode in ("omega_norm", "source_norm", "norm", "magnitude"):
+            gamma_omega_mag = np.linalg.norm(gamma_source_vort, axis=1).astype(np.float32)
             gamma = (gamma_scale * gamma_omega_mag[idx] * mv[idx]).astype(np.float32)
         elif gamma_mode in ("omega_dot_t", "source_dot_t", "dot_t", "projection"):
             gamma = (gamma_scale * np.sum(gamma_source_vort[idx, :dim] * tangent, axis=1) * mv[idx]).astype(np.float32)
@@ -739,6 +798,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self.seg_solver._seed_segments_kernel(offset, n_new, xm[:n_new], xp[:n_new], gamma[:n_new], seg_type)
         self.seg_solver._set_point_vortex_volume_kernel(offset, n_new, mv[idx[:n_new]].astype(np.float32, copy=False))
         if self._segment_initial_sph_then_bs and not self._one_step_vortex_impulse:
+            if vel is None:
+                vel = self.ps.v.to_numpy()[:n].astype(np.float32, copy=False)
             init_vel = vel[idx[:n_new], :].astype(np.float32, copy=False)
             self._set_segment_initial_sph_advect_velocity_kernel(
                 offset, n_new, init_vel, int(self._initial_sph_advect_steps)
@@ -774,6 +835,417 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 f"[sph-vort-inject] step={step} region={region} added={n_new} "
                 f"|gamma|max={float(np.max(np.abs(gamma[:n_new]))):.4e}"
             )
+
+    def _try_inject_segments_from_sph_boundary_vorticity_gpu_fast_path(self) -> bool:
+        if int(self.ps.dim) == 3 and int(self.ss_seg.dim) == 3:
+            return self._try_inject_segments_from_sph_boundary_vorticity_gpu_fast_path_3d()
+        if int(self.ps.dim) != 2 or int(self.ss_seg.dim) != 2:
+            return False
+        if self._segment_initial_sph_then_bs and not self._one_step_vortex_impulse:
+            return False
+        vort_src = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSource", "vorticity") or "vorticity").lower().strip()
+        threshold_src = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionThresholdSource", vort_src) or vort_src).lower().strip()
+        orientation = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionOrientation", "omega") or "omega").lower().strip()
+        gamma_mode = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionGammaMode", "omega_dot_t") or "omega_dot_t").lower().strip()
+        selection = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSelection", "top_strength") or "top_strength").lower().strip()
+        region = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionRegion", "circle_band") or "circle_band").lower().strip()
+        residual_enabled = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionUseResidualVorticity", False))
+        residual_debug = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityResidualDebug", False))
+        sign_debug = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSignDebug", False))
+        inject_log = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionLog", False))
+        supported = (
+            vort_src == "vorticity"
+            and threshold_src == "vorticity"
+            and orientation in ("omega", "vorticity", "vorticity_direction")
+            and gamma_mode in ("source_component", "omega_component", "z", "z_component")
+            and selection in ("first", "atomic", "gpu_first", "top_strength", "proportional_sign")
+            and region in ("box", "aabb", "rect", "rectangle", "injection_box", "generation_box", "all", "global", "whole_domain", "domain", "anywhere", "circle_band")
+            and residual_enabled
+            and not residual_debug
+            and not sign_debug
+            and not inject_log
+        )
+        if not supported:
+            return False
+
+        n = int(self.ps.particle_num[None])
+        if n <= 0:
+            return True
+        offset = int(self.ss_seg.segment_num[None])
+        cap = int(self.ss_seg.segment_max_num)
+        if offset >= cap:
+            return True
+        max_per = max(0, int(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionMaxPerStep", 32)))
+        if max_per <= 0:
+            return True
+        max_new = min(max_per, cap - offset)
+        if max_new <= 0:
+            return True
+
+        center_cfg = self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionCircleCenter", None)
+        if center_cfg is None:
+            center_cfg = self.seg_cfg.get_cfg("boundaryCircleCenter", [0.65, 0.5])
+        c = np.asarray(center_cfg, dtype=np.float32).reshape(-1)
+        cx = float(c[0]) if c.size > 0 else 0.65
+        cy = float(c[1]) if c.size > 1 else 0.5
+        radius = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionCircleRadius", self.seg_cfg.get_cfg("boundaryCircleRadius", 0.1)))
+        band = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionDistance", 0.02))
+        threshold = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionThreshold", 10.0))
+        seg_len = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentLength", self.seg_cfg.get_cfg("boundarySegmentLength", 0.018)))
+        gamma_scale = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionGammaScale", 1.0))
+        seg_type = int(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentTypeId", self.seg_cfg.get_cfg("initSegmentTypeId", 0)))
+        support = float(self.ps.support_radius * float(self.seg_cfg.get_cfg("sphBoundaryVortexResidualSupportRadiusScale", 1.0)))
+        orient_by_sign = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionOrientBySign", True))
+
+        box_start = np.asarray(
+            self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionDomainStart", self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionBoxStart", self.ss_seg.domain_start)),
+            dtype=np.float32,
+        ).reshape(-1)
+        box_end = np.asarray(
+            self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionDomainEnd", self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionBoxEnd", self.ss_seg.domain_end)),
+            dtype=np.float32,
+        ).reshape(-1)
+        bx0 = float(box_start[0]) if box_start.size > 0 else -1e20
+        by0 = float(box_start[1]) if box_start.size > 1 else -1e20
+        bx1 = float(box_end[0]) if box_end.size > 0 else 1e20
+        by1 = float(box_end[1]) if box_end.size > 1 else 1e20
+        lo_x = min(bx0, bx1)
+        lo_y = min(by0, by1)
+        hi_x = max(bx0, bx1)
+        hi_y = max(by0, by1)
+        if region in ("all", "global", "whole_domain", "domain", "anywhere"):
+            region_mode = 0
+        elif region in ("box", "aabb", "rect", "rectangle", "injection_box", "generation_box"):
+            region_mode = 1
+        else:
+            region_mode = 2
+
+        self._gpu_vorticity_injection_count[None] = 0
+        self._inject_segments_from_sph_boundary_vorticity_gpu_kernel(
+            offset,
+            max_new,
+            int(n),
+            int(self.ss_seg.segment_num[None]),
+            float(cx),
+            float(cy),
+            float(radius),
+            float(band),
+            float(threshold),
+            float(lo_x),
+            float(lo_y),
+            float(hi_x),
+            float(hi_y),
+            int(region_mode),
+            float(seg_len),
+            float(gamma_scale),
+            int(seg_type),
+            float(support),
+            int(1 if orient_by_sign else 0),
+        )
+        n_new = int(self._gpu_vorticity_injection_count[None])
+        if n_new > 0:
+            self.ss_seg.segment_num[None] = offset + n_new
+        return True
+
+    def _try_inject_segments_from_sph_boundary_vorticity_gpu_fast_path_3d(self) -> bool:
+        if self._segment_initial_sph_then_bs and not self._one_step_vortex_impulse:
+            return False
+        vort_src = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSource", "vorticity") or "vorticity").lower().strip()
+        threshold_src = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionThresholdSource", vort_src) or vort_src).lower().strip()
+        orientation = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionOrientation", "omega") or "omega").lower().strip()
+        gamma_mode = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionGammaMode", "omega_dot_t") or "omega_dot_t").lower().strip()
+        selection = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSelection", "top_strength") or "top_strength").lower().strip()
+        region = str(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionRegion", "circle_band") or "circle_band").lower().strip()
+        residual_enabled = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionUseResidualVorticity", False))
+        residual_debug = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityResidualDebug", False))
+        sign_debug = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSignDebug", False))
+        inject_log = bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionLog", False))
+        supported = (
+            vort_src == "vorticity"
+            and threshold_src == "vorticity"
+            and orientation in ("auto", "omega", "vorticity", "vorticity_direction")
+            and gamma_mode in ("omega_dot_t", "source_dot_t", "dot_t", "projection")
+            and selection in ("first", "atomic", "gpu_first", "top_strength")
+            and region in ("box", "aabb", "rect", "rectangle", "injection_box", "generation_box", "all", "global", "whole_domain", "domain", "anywhere", "circle_band")
+            and residual_enabled
+            and not residual_debug
+            and not sign_debug
+            and not inject_log
+        )
+        if not supported:
+            return False
+
+        n = int(self.ps.particle_num[None])
+        if n <= 0:
+            return True
+        offset = int(self.ss_seg.segment_num[None])
+        cap = int(self.ss_seg.segment_max_num)
+        if offset >= cap:
+            return True
+        max_per = max(0, int(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionMaxPerStep", 32)))
+        if max_per <= 0:
+            return True
+        max_new = min(max_per, cap - offset)
+        if max_new <= 0:
+            return True
+
+        center_cfg = self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionCircleCenter", None)
+        if center_cfg is None:
+            center_cfg = self.seg_cfg.get_cfg("boundaryCircleCenter", [0.65, 0.5, 0.0])
+        c = np.asarray(center_cfg, dtype=np.float32).reshape(-1)
+        cx = float(c[0]) if c.size > 0 else 0.65
+        cy = float(c[1]) if c.size > 1 else 0.5
+        radius = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionCircleRadius", self.seg_cfg.get_cfg("boundaryCircleRadius", 0.1)))
+        band = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionDistance", 0.02))
+        threshold = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionThreshold", 10.0))
+        seg_len = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentLength", self.seg_cfg.get_cfg("boundarySegmentLength", 0.018)))
+        gamma_scale = float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionGammaScale", 1.0))
+        seg_type = int(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentTypeId", self.seg_cfg.get_cfg("initSegmentTypeId", 0)))
+        support = float(self.ps.support_radius * float(self.seg_cfg.get_cfg("sphBoundaryVortexResidualSupportRadiusScale", 1.0)))
+
+        box_start = np.asarray(
+            self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionDomainStart", self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionBoxStart", self.ss_seg.domain_start)),
+            dtype=np.float32,
+        ).reshape(-1)
+        box_end = np.asarray(
+            self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionDomainEnd", self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionBoxEnd", self.ss_seg.domain_end)),
+            dtype=np.float32,
+        ).reshape(-1)
+        bx0 = float(box_start[0]) if box_start.size > 0 else -1e20
+        by0 = float(box_start[1]) if box_start.size > 1 else -1e20
+        bz0 = float(box_start[2]) if box_start.size > 2 else -1e20
+        bx1 = float(box_end[0]) if box_end.size > 0 else 1e20
+        by1 = float(box_end[1]) if box_end.size > 1 else 1e20
+        bz1 = float(box_end[2]) if box_end.size > 2 else 1e20
+        lo_x = min(bx0, bx1)
+        lo_y = min(by0, by1)
+        lo_z = min(bz0, bz1)
+        hi_x = max(bx0, bx1)
+        hi_y = max(by0, by1)
+        hi_z = max(bz0, bz1)
+        if region in ("all", "global", "whole_domain", "domain", "anywhere"):
+            region_mode = 0
+        elif region in ("box", "aabb", "rect", "rectangle", "injection_box", "generation_box"):
+            region_mode = 1
+        else:
+            region_mode = 2
+
+        self._gpu_vorticity_injection_count[None] = 0
+        self._inject_segments_from_sph_boundary_vorticity_gpu_kernel_3d(
+            offset,
+            max_new,
+            int(n),
+            int(self.ss_seg.segment_num[None]),
+            float(cx),
+            float(cy),
+            float(radius),
+            float(band),
+            float(threshold),
+            float(lo_x),
+            float(lo_y),
+            float(lo_z),
+            float(hi_x),
+            float(hi_y),
+            float(hi_z),
+            int(region_mode),
+            float(seg_len),
+            float(gamma_scale),
+            int(seg_type),
+            float(support),
+        )
+        n_new = int(self._gpu_vorticity_injection_count[None])
+        if n_new > 0:
+            self.ss_seg.segment_num[None] = offset + n_new
+        return True
+
+    @ti.func
+    def _cubic_kernel_ti(self, r_norm: float, support_radius: float) -> float:
+        h = support_radius
+        out = 0.0
+        if h > 1e-12:
+            q = r_norm / h
+            k = 1.3333 / h
+            if ti.static(self.ps.dim == 2):
+                k = 1.8189 / (h * h)
+            elif ti.static(self.ps.dim == 3):
+                k = 2.5465 / (h * h * h)
+            if q <= 0.5:
+                out = k * (6.0 * q * q * q - 6.0 * q * q + 1.0)
+            elif q <= 1.0:
+                one_minus_q = 1.0 - q
+                out = k * 2.0 * one_minus_q * one_minus_q * one_minus_q
+        return out
+
+    @ti.kernel
+    def _inject_segments_from_sph_boundary_vorticity_gpu_kernel(
+        self,
+        offset: ti.i32,
+        max_new: ti.i32,
+        particle_count: ti.i32,
+        segment_count: ti.i32,
+        cx: float,
+        cy: float,
+        radius: float,
+        band: float,
+        threshold: float,
+        lo_x: float,
+        lo_y: float,
+        hi_x: float,
+        hi_y: float,
+        region_mode: ti.i32,
+        seg_len: float,
+        gamma_scale: float,
+        seg_type_id: ti.i32,
+        support_radius: float,
+        orient_by_sign: ti.i32,
+    ):
+        for p in range(particle_count):
+            if self.ps.material[p] == self.ps.material_fluid:
+                pos = self.ps.x[p]
+                omega = self.ps.vorticity[p]
+                threshold_mag = ti.sqrt(omega[0] * omega[0] + omega[1] * omega[1] + omega[2] * omega[2])
+                inside_region = 0
+                dx_c = pos[0] - cx
+                dy_c = pos[1] - cy
+                rr = ti.sqrt(dx_c * dx_c + dy_c * dy_c)
+                signed_dist = rr - radius
+                if region_mode == 0:
+                    inside_region = 1
+                elif region_mode == 1:
+                    if pos[0] >= lo_x and pos[0] <= hi_x and pos[1] >= lo_y and pos[1] <= hi_y:
+                        inside_region = 1
+                else:
+                    if signed_dist >= 0.0 and signed_dist <= band:
+                        inside_region = 1
+                if inside_region == 1 and threshold_mag >= threshold:
+                    k = ti.atomic_add(self._gpu_vorticity_injection_count[None], 1)
+                    if k < max_new:
+                        omega_vortex_z = 0.0
+                        wsum = 0.0
+                        if support_radius > 1e-12:
+                            for j in range(segment_count):
+                                if self.ss_seg.active[j] == 1:
+                                    if not (ti.static(self._vortex_ghost_skip_boundary) and self.ss_seg.seg_type[j] == self._vortex_ghost_skip_type):
+                                        cseg = 0.5 * (self.ss_seg.x_minus[j] + self.ss_seg.x_plus[j])
+                                        rx = pos[0] - cseg[0]
+                                        ry = pos[1] - cseg[1]
+                                        rn = ti.sqrt(rx * rx + ry * ry)
+                                        if rn < support_radius:
+                                            w = self._cubic_kernel_ti(rn, support_radius)
+                                            vol = self.seg_solver.point_vortex_volume[j]
+                                            if vol > 1e-12:
+                                                omega_vortex_z += w * self.ss_seg.gamma[j]
+                                                wsum += vol * w
+                        residual_z = omega[2]
+                        if wsum > 1e-12:
+                            residual_z = omega[2] - omega_vortex_z / wsum
+                        sign = 1.0
+                        if omega[2] < 0.0:
+                            sign = -1.0
+                        tangent = ti.Vector([1.0, 0.0])
+                        if orient_by_sign == 1:
+                            tangent = tangent * sign
+                        half = 0.5 * seg_len
+                        i = offset + k
+                        xm = ti.Vector([pos[0] - half * tangent[0], pos[1] - half * tangent[1]])
+                        xp = ti.Vector([pos[0] + half * tangent[0], pos[1] + half * tangent[1]])
+                        self.ss_seg.x_minus[i] = xm
+                        self.ss_seg.x_plus[i] = xp
+                        self.ss_seg.gamma[i] = gamma_scale * residual_z * self.ps.m_V[p]
+                        self.ss_seg.active[i] = 1
+                        self.ss_seg.age[i] = 0.0
+                        self.ss_seg.seg_type[i] = seg_type_id
+                        self.seg_solver.point_vortex_volume[i] = self.ps.m_V[p]
+                    else:
+                        ti.atomic_sub(self._gpu_vorticity_injection_count[None], 1)
+
+    @ti.kernel
+    def _inject_segments_from_sph_boundary_vorticity_gpu_kernel_3d(
+        self,
+        offset: ti.i32,
+        max_new: ti.i32,
+        particle_count: ti.i32,
+        segment_count: ti.i32,
+        cx: float,
+        cy: float,
+        radius: float,
+        band: float,
+        threshold: float,
+        lo_x: float,
+        lo_y: float,
+        lo_z: float,
+        hi_x: float,
+        hi_y: float,
+        hi_z: float,
+        region_mode: ti.i32,
+        seg_len: float,
+        gamma_scale: float,
+        seg_type_id: ti.i32,
+        support_radius: float,
+    ):
+        for p in range(particle_count):
+            if self.ps.material[p] == self.ps.material_fluid:
+                pos = self.ps.x[p]
+                omega = self.ps.vorticity[p]
+                threshold_mag = omega.norm()
+                inside_region = 0
+                dx_c = pos[0] - cx
+                dy_c = pos[1] - cy
+                rr = ti.sqrt(dx_c * dx_c + dy_c * dy_c)
+                signed_dist = rr - radius
+                if region_mode == 0:
+                    inside_region = 1
+                elif region_mode == 1:
+                    if (
+                        pos[0] >= lo_x and pos[0] <= hi_x
+                        and pos[1] >= lo_y and pos[1] <= hi_y
+                        and pos[2] >= lo_z and pos[2] <= hi_z
+                    ):
+                        inside_region = 1
+                else:
+                    if signed_dist >= 0.0 and signed_dist <= band:
+                        inside_region = 1
+                if inside_region == 1 and threshold_mag >= threshold:
+                    k = ti.atomic_add(self._gpu_vorticity_injection_count[None], 1)
+                    if k < max_new:
+                        omega_vortex_z = 0.0
+                        wsum = 0.0
+                        if support_radius > 1e-12:
+                            for j in range(segment_count):
+                                if self.ss_seg.active[j] == 1:
+                                    if not (ti.static(self._vortex_ghost_skip_boundary) and self.ss_seg.seg_type[j] == self._vortex_ghost_skip_type):
+                                        cseg = 0.5 * (self.ss_seg.x_minus[j] + self.ss_seg.x_plus[j])
+                                        r = pos - cseg
+                                        rn = r.norm()
+                                        if rn < support_radius:
+                                            w = self._cubic_kernel_ti(rn, support_radius)
+                                            vol = self.seg_solver.point_vortex_volume[j]
+                                            if vol > 1e-12:
+                                                omega_vortex_z += w * self.ss_seg.gamma[j]
+                                                wsum += vol * w
+                        residual = omega
+                        if wsum > 1e-12:
+                            residual[2] = omega[2] - omega_vortex_z / wsum
+                        tangent = omega
+                        tn = tangent.norm()
+                        if tn > 1e-8:
+                            tangent = tangent / tn
+                        else:
+                            tangent = ti.Vector([1.0, 0.0, 0.0])
+                        half = 0.5 * seg_len
+                        i = offset + k
+                        self.ss_seg.x_minus[i] = pos - half * tangent
+                        self.ss_seg.x_plus[i] = pos + half * tangent
+                        self.ss_seg.gamma[i] = gamma_scale * residual.dot(tangent) * self.ps.m_V[p]
+                        self.ss_seg.active[i] = 1
+                        self.ss_seg.age[i] = 0.0
+                        self.ss_seg.seg_type[i] = seg_type_id
+                        self.seg_solver.point_vortex_volume[i] = self.ps.m_V[p]
+                        self.seg_solver.sph_advect_velocity_minus[i] *= 0.0
+                        self.seg_solver.sph_advect_velocity_plus[i] *= 0.0
+                        self.seg_solver.initial_sph_advect_remaining[i] = 0
+                    else:
+                        ti.atomic_sub(self._gpu_vorticity_injection_count[None], 1)
 
     @ti.kernel
     def _set_segment_initial_sph_advect_velocity_kernel(
@@ -1071,6 +1543,481 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             f"abs_gamma_mean={float(np.mean(abs_g)):.6e}"
         )
 
+    def _try_combined_gpu_delete_point_vortices(self) -> bool:
+        if int(self.ss_seg.dim) == 3:
+            return self._try_combined_gpu_delete_segments_3d()
+        if int(self.ss_seg.dim) != 2:
+            return False
+        if not bool(self.seg_cfg.get_cfg("enableGpuDeleteCompact", False)):
+            return False
+        if not getattr(self.seg_solver, "_bs_2d_point", False):
+            return False
+        n = int(self.ss_seg.segment_num[None])
+        if n <= 0:
+            return True
+        delete_inside = bool(self.seg_cfg.get_cfg("deleteInteriorSegmentsInsideObstacles", False))
+        delete_slow = bool(self.seg_cfg.get_cfg("deleteSlowPointVorticesEnabled", False))
+        enable_weak = bool(self.seg_cfg.get_cfg("enableDeleteWeakSegments", True))
+        if not (delete_inside or delete_slow or enable_weak):
+            return True
+        margin_cfg = self.seg_cfg.get_cfg("deleteInsideObstacleMargin", None)
+        if margin_cfg is None:
+            margin = 0.5 * float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentLength", self.seg_cfg.get_cfg("boundarySegmentLength", 0.018)))
+        else:
+            margin = float(margin_cfg)
+        block_data = []
+        if delete_inside and bool(self.seg_cfg.get_cfg("deleteInsideObstacleIncludeRigidBlocks", True)):
+            default_ex = self.seg_cfg.get_cfg("boundaryRigidBlockExcludeObjectIds", []) or []
+            exclude_ids = set(int(x) for x in (self.seg_cfg.get_cfg("deleteInsideObstacleRigidBlockExcludeObjectIds", default_ex) or []))
+            include_ids_cfg = self.seg_cfg.get_cfg("deleteInsideObstacleRigidBlockObjectIds", None)
+            include_ids = None if include_ids_cfg is None else set(int(x) for x in include_ids_cfg)
+            for blk in self.seg_cfg.get_obstacles():
+                oid = int(blk.get("objectId", -999999))
+                if oid in exclude_ids:
+                    continue
+                if include_ids is not None and oid not in include_ids:
+                    continue
+                start = np.asarray(blk.get("start", [0.0, 0.0]), dtype=np.float32).reshape(-1)
+                end = np.asarray(blk.get("end", [0.0, 0.0]), dtype=np.float32).reshape(-1)
+                trans = np.asarray(blk.get("translation", [0.0, 0.0]), dtype=np.float32).reshape(-1)
+                scale = np.asarray(blk.get("scale", [1.0, 1.0]), dtype=np.float32).reshape(-1)
+                if start.size < 2 or end.size < 2:
+                    continue
+                if trans.size < 2:
+                    trans = np.pad(trans, (0, 2 - trans.size), constant_values=0.0)
+                if scale.size < 2:
+                    scale = np.pad(scale, (0, 2 - scale.size), constant_values=1.0)
+                lo_b = start[:2] + trans[:2]
+                hi_b = lo_b + (end[:2] - start[:2]) * scale[:2]
+                lo2 = np.minimum(lo_b, hi_b) - margin
+                hi2 = np.maximum(lo_b, hi_b) + margin
+                block_data.append((float(lo2[0]), float(lo2[1]), float(hi2[0]), float(hi2[1])))
+        if len(block_data) > 4:
+            return False
+        while len(block_data) < 4:
+            block_data.append((0.0, 0.0, -1.0, -1.0))
+        block_count = int(sum(1 for b in block_data if b[2] >= b[0] and b[3] >= b[1]))
+        def pack4(vals):
+            arr = [int(v) for v in vals[:4]]
+            while len(arr) < 4:
+                arr.append(-999999)
+            return arr
+        inside_cfg = self.seg_cfg.get_cfg("deleteInsideObstacleSegmentTypeIds", None)
+        if inside_cfg is None:
+            inside_ids = pack4([int(self.seg_cfg.get_cfg("deleteInsideObstacleSegmentTypeId", self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentTypeId", 0)))])
+        else:
+            inside_ids = pack4([int(t) for t in inside_cfg])
+        slow_cfg = self.seg_cfg.get_cfg("deleteSlowPointVortexSegmentTypeIds", None)
+        if slow_cfg is None:
+            slow_ids = pack4([int(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentTypeId", 0))])
+        else:
+            slow_ids = pack4([int(t) for t in slow_cfg])
+        cylinders = []
+        if delete_inside and bool(self.seg_cfg.get_cfg("deleteInsideObstacleIncludeCylinders", True)):
+            cylinders.extend(self.seg_cfg.config.get("RigidCylinders", []) or [])
+            cylinders.extend(self.seg_cfg.config.get("Cylinders", []) or [])
+            if bool(self.seg_cfg.get_cfg("deleteInsideObstacleIncludeBoundaryCircle", True)):
+                bc = self.seg_cfg.get_cfg("boundaryCircleCenter", None)
+                br = self.seg_cfg.get_cfg("boundaryCircleRadius", None)
+                if bc is not None and br is not None:
+                    cylinders.append({"center": bc, "radius": br})
+        if len(cylinders) > 4:
+            return False
+        cyl_data = []
+        for cyl in cylinders:
+            c = np.asarray(cyl.get("center", [0.0, 0.0]), dtype=np.float32).reshape(-1)
+            if c.size >= 2:
+                cyl_data.append((float(c[0]), float(c[1]), float(cyl.get("radius", 0.0)) + margin))
+        while len(cyl_data) < 4:
+            cyl_data.append((0.0, 0.0, -1.0))
+        cyl_count = int(sum(1 for c in cyl_data if c[2] >= 0.0))
+        skip_topo = self.seg_solver._topology_skip_type_ids()
+        sa, sb, sc, sd = self.seg_solver._skip_ids_for_kernel(skip_topo)
+        ofx_cfg = self.seg_cfg.get_cfg("outflowDeleteCenterBeyondX", None)
+        max_age_cfg = self.seg_cfg.get_cfg("deleteMaxAge", None)
+        lo = self.ss_seg.domain_start.astype(np.float32)
+        hi = self.ss_seg.domain_end.astype(np.float32)
+        self.seg_solver._compact_counter[None] = 0
+        self._combined_delete_point_vortices_gpu_kernel(
+            int(n), int(delete_inside), int(delete_slow), int(enable_weak),
+            float(self.seg_solver.delete_gamma_threshold),
+            float(self.seg_cfg.get_cfg("deleteSlowPointVortexSpeedThreshold", 1e-6)),
+            int(self.seg_cfg.get_cfg("boundarySegmentTypeId", 2)),
+            inside_ids[0], inside_ids[1], inside_ids[2], inside_ids[3],
+            slow_ids[0], slow_ids[1], slow_ids[2], slow_ids[3],
+            block_count,
+            block_data[0][0], block_data[0][1], block_data[0][2], block_data[0][3],
+            block_data[1][0], block_data[1][1], block_data[1][2], block_data[1][3],
+            block_data[2][0], block_data[2][1], block_data[2][2], block_data[2][3],
+            block_data[3][0], block_data[3][1], block_data[3][2], block_data[3][3],
+            cyl_count,
+            cyl_data[0][0], cyl_data[0][1], cyl_data[0][2],
+            cyl_data[1][0], cyl_data[1][1], cyl_data[1][2],
+            cyl_data[2][0], cyl_data[2][1], cyl_data[2][2],
+            cyl_data[3][0], cyl_data[3][1], cyl_data[3][2],
+            int(1 if ofx_cfg is not None else 0), float(ofx_cfg) if ofx_cfg is not None else 0.0,
+            int(1 if max_age_cfg is not None else 0), float(max_age_cfg) if max_age_cfg is not None else 0.0,
+            int(1 if bool(self.seg_cfg.get_cfg("deleteOutsideDomain", False)) else 0),
+            float(lo[0]), float(lo[1]) if self.ss_seg.dim >= 2 else 0.0,
+            float(hi[0]), float(hi[1]) if self.ss_seg.dim >= 2 else 0.0,
+            sa, sb, sc, sd,
+        )
+        self.seg_solver._copy_compacted_segments_kernel(n)
+        self.ss_seg.update_segment_geometry()
+        return True
+
+    def _try_combined_gpu_delete_segments_3d(self) -> bool:
+        if int(self.ss_seg.dim) != 3:
+            return False
+        if not bool(self.seg_cfg.get_cfg("enableGpuDeleteCompact", False)):
+            return False
+        n = int(self.ss_seg.segment_num[None])
+        if n <= 0:
+            return True
+        delete_inside = bool(self.seg_cfg.get_cfg("deleteInteriorSegmentsInsideObstacles", False))
+        delete_slow = bool(self.seg_cfg.get_cfg("deleteSlowPointVorticesEnabled", False))
+        enable_weak = bool(self.seg_cfg.get_cfg("enableDeleteWeakSegments", True))
+        has_outflow = self.seg_cfg.get_cfg("outflowDeleteCenterBeyondX", None) is not None
+        has_max_age = self.seg_cfg.get_cfg("deleteMaxAge", None) is not None
+        delete_outside = bool(self.seg_cfg.get_cfg("deleteOutsideDomain", False))
+        if not (delete_inside or delete_slow or enable_weak or has_outflow or has_max_age or delete_outside):
+            return True
+
+        margin_cfg = self.seg_cfg.get_cfg("deleteInsideObstacleMargin", None)
+        if margin_cfg is None:
+            margin = 0.5 * float(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentLength", self.seg_cfg.get_cfg("boundarySegmentLength", 0.018)))
+        else:
+            margin = float(margin_cfg)
+
+        block_data = []
+        if delete_inside and bool(self.seg_cfg.get_cfg("deleteInsideObstacleIncludeRigidBlocks", True)):
+            default_ex = self.seg_cfg.get_cfg("boundaryRigidBlockExcludeObjectIds", []) or []
+            exclude_ids = set(int(x) for x in (self.seg_cfg.get_cfg("deleteInsideObstacleRigidBlockExcludeObjectIds", default_ex) or []))
+            include_ids_cfg = self.seg_cfg.get_cfg("deleteInsideObstacleRigidBlockObjectIds", None)
+            include_ids = None if include_ids_cfg is None else set(int(x) for x in include_ids_cfg)
+            for blk in self.seg_cfg.get_obstacles():
+                oid = int(blk.get("objectId", -999999))
+                if oid in exclude_ids:
+                    continue
+                if include_ids is not None and oid not in include_ids:
+                    continue
+                start = np.asarray(blk.get("start", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
+                end = np.asarray(blk.get("end", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
+                trans = np.asarray(blk.get("translation", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
+                scale = np.asarray(blk.get("scale", [1.0, 1.0, 1.0]), dtype=np.float32).reshape(-1)
+                if start.size < 3 or end.size < 3:
+                    continue
+                if trans.size < 3:
+                    trans = np.pad(trans, (0, 3 - trans.size), constant_values=0.0)
+                if scale.size < 3:
+                    scale = np.pad(scale, (0, 3 - scale.size), constant_values=1.0)
+                lo_b = start[:3] + trans[:3]
+                hi_b = lo_b + (end[:3] - start[:3]) * scale[:3]
+                lo3 = np.minimum(lo_b, hi_b) - margin
+                hi3 = np.maximum(lo_b, hi_b) + margin
+                block_data.append((float(lo3[0]), float(lo3[1]), float(lo3[2]), float(hi3[0]), float(hi3[1]), float(hi3[2])))
+        if len(block_data) > 8:
+            return False
+        while len(block_data) < 8:
+            block_data.append((0.0, 0.0, 0.0, -1.0, -1.0, -1.0))
+        block_arr = np.asarray(block_data, dtype=np.float32)
+        block_count = int(sum(1 for b in block_data if b[3] >= b[0] and b[4] >= b[1] and b[5] >= b[2]))
+
+        cylinders = []
+        if delete_inside and bool(self.seg_cfg.get_cfg("deleteInsideObstacleIncludeCylinders", True)):
+            cylinders.extend(self.seg_cfg.config.get("RigidCylinders", []) or [])
+            cylinders.extend(self.seg_cfg.config.get("Cylinders", []) or [])
+            if bool(self.seg_cfg.get_cfg("deleteInsideObstacleIncludeBoundaryCircle", True)):
+                bc = self.seg_cfg.get_cfg("boundaryCircleCenter", None)
+                br = self.seg_cfg.get_cfg("boundaryCircleRadius", None)
+                if bc is not None and br is not None:
+                    cylinders.append({"center": bc, "radius": br, "height": -1.0, "axis": [0.0, 0.0, 1.0]})
+        if len(cylinders) > 4:
+            return False
+        cyl_data = []
+        for cyl in cylinders:
+            c = np.asarray(cyl.get("center", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
+            if c.size < 3:
+                c = np.pad(c, (0, 3 - c.size), constant_values=0.0)
+            axis_cfg = cyl.get("axis", [0.0, 0.0, 1.0])
+            if isinstance(axis_cfg, str):
+                axis = np.array([1.0, 0.0, 0.0], dtype=np.float32) if axis_cfg.lower() == "x" else (
+                    np.array([0.0, 1.0, 0.0], dtype=np.float32) if axis_cfg.lower() == "y" else np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                )
+            else:
+                axis = np.asarray(axis_cfg, dtype=np.float32).reshape(-1)
+                if axis.size < 3:
+                    axis = np.pad(axis, (0, 3 - axis.size), constant_values=0.0)
+            axis = axis[:3]
+            axis = axis / (np.linalg.norm(axis) + 1e-8)
+            height = cyl.get("height", None)
+            if height is None and cyl.get("halfHeight", None) is not None:
+                half_h = float(cyl.get("halfHeight")) + margin
+            elif height is None:
+                half_h = -1.0
+            else:
+                half_h = 0.5 * float(height) + margin
+            cyl_data.append((float(c[0]), float(c[1]), float(c[2]), float(cyl.get("radius", 0.0)) + margin, float(axis[0]), float(axis[1]), float(axis[2]), float(half_h)))
+        while len(cyl_data) < 4:
+            cyl_data.append((0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, -1.0))
+        cyl_arr = np.asarray(cyl_data, dtype=np.float32)
+        cyl_count = int(sum(1 for c in cyl_data if c[3] >= 0.0))
+
+        def pack4(vals):
+            arr = [int(v) for v in vals[:4]]
+            while len(arr) < 4:
+                arr.append(-999999)
+            return arr
+        inside_cfg = self.seg_cfg.get_cfg("deleteInsideObstacleSegmentTypeIds", None)
+        if inside_cfg is None:
+            inside_ids = pack4([int(self.seg_cfg.get_cfg("deleteInsideObstacleSegmentTypeId", self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentTypeId", 0)))])
+        else:
+            inside_ids = pack4([int(t) for t in inside_cfg])
+        slow_cfg = self.seg_cfg.get_cfg("deleteSlowPointVortexSegmentTypeIds", None)
+        if slow_cfg is None:
+            slow_ids = pack4([int(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentTypeId", 0))])
+        else:
+            slow_ids = pack4([int(t) for t in slow_cfg])
+
+        skip_topo = self.seg_solver._topology_skip_type_ids()
+        sa, sb, sc, sd = self.seg_solver._skip_ids_for_kernel(skip_topo)
+        ofx_cfg = self.seg_cfg.get_cfg("outflowDeleteCenterBeyondX", None)
+        max_age_cfg = self.seg_cfg.get_cfg("deleteMaxAge", None)
+        lo = self.ss_seg.domain_start.astype(np.float32)
+        hi = self.ss_seg.domain_end.astype(np.float32)
+        self.seg_solver._compact_counter[None] = 0
+        self._combined_delete_segments_gpu_kernel_3d(
+            int(n), int(delete_inside), int(delete_slow), int(enable_weak),
+            float(self.seg_solver.delete_gamma_threshold),
+            float(self.seg_cfg.get_cfg("deleteSlowPointVortexSpeedThreshold", 1e-6)),
+            int(self.seg_cfg.get_cfg("boundarySegmentTypeId", 2)),
+            inside_ids[0], inside_ids[1], inside_ids[2], inside_ids[3],
+            slow_ids[0], slow_ids[1], slow_ids[2], slow_ids[3],
+            block_arr, int(block_count),
+            cyl_arr, int(cyl_count),
+            int(1 if ofx_cfg is not None else 0), float(ofx_cfg) if ofx_cfg is not None else 0.0,
+            int(1 if max_age_cfg is not None else 0), float(max_age_cfg) if max_age_cfg is not None else 0.0,
+            int(1 if delete_outside else 0),
+            float(lo[0]), float(lo[1]), float(lo[2]),
+            float(hi[0]), float(hi[1]), float(hi[2]),
+            sa, sb, sc, sd,
+        )
+        self.seg_solver._copy_compacted_segments_kernel(n)
+        self.ss_seg.update_segment_geometry()
+        return True
+
+    @ti.kernel
+    def _combined_delete_segments_gpu_kernel_3d(
+        self,
+        n: ti.i32,
+        delete_inside: ti.i32,
+        delete_slow: ti.i32,
+        enable_weak: ti.i32,
+        gamma_threshold: float,
+        slow_threshold: float,
+        boundary_type: ti.i32,
+        inside_a: ti.i32,
+        inside_b: ti.i32,
+        inside_c: ti.i32,
+        inside_d: ti.i32,
+        slow_a: ti.i32,
+        slow_b: ti.i32,
+        slow_c: ti.i32,
+        slow_d: ti.i32,
+        blocks: ti.types.ndarray(),
+        block_count: ti.i32,
+        cylinders: ti.types.ndarray(),
+        cyl_count: ti.i32,
+        has_outflow: ti.i32,
+        outflow_x: float,
+        has_max_age: ti.i32,
+        max_age: float,
+        delete_outside: ti.i32,
+        lo0: float,
+        lo1: float,
+        lo2: float,
+        hi0: float,
+        hi1: float,
+        hi2: float,
+        skip_a: ti.i32,
+        skip_b: ti.i32,
+        skip_c: ti.i32,
+        skip_d: ti.i32,
+    ):
+        for i in range(n):
+            st = self.ss_seg.seg_type[i]
+            skip = (st == skip_a) or (st == skip_b) or (st == skip_c) or (st == skip_d)
+            keep = self.ss_seg.active[i] == 1
+            center = 0.5 * (self.ss_seg.x_minus[i] + self.ss_seg.x_plus[i])
+            target_inside = (st == inside_a) or (st == inside_b) or (st == inside_c) or (st == inside_d)
+            target_slow = (st == slow_a) or (st == slow_b) or (st == slow_c) or (st == slow_d)
+            if keep and delete_inside == 1 and target_inside:
+                inside = False
+                for b in range(block_count):
+                    inside = inside or (
+                        center[0] >= blocks[b, 0] and center[0] <= blocks[b, 3]
+                        and center[1] >= blocks[b, 1] and center[1] <= blocks[b, 4]
+                        and center[2] >= blocks[b, 2] and center[2] <= blocks[b, 5]
+                    )
+                for c in range(cyl_count):
+                    rel = ti.Vector([
+                        center[0] - cylinders[c, 0],
+                        center[1] - cylinders[c, 1],
+                        center[2] - cylinders[c, 2],
+                    ])
+                    axis = ti.Vector([cylinders[c, 4], cylinders[c, 5], cylinders[c, 6]])
+                    axial_signed = rel.dot(axis)
+                    radial = rel - axial_signed * axis
+                    cyl_inside = radial.dot(radial) <= cylinders[c, 3] * cylinders[c, 3]
+                    if cylinders[c, 7] >= 0.0:
+                        cyl_inside = cyl_inside and ti.abs(axial_signed) <= cylinders[c, 7]
+                    inside = inside or cyl_inside
+                if inside:
+                    keep = False
+            if keep and delete_slow == 1 and target_slow and st != boundary_type:
+                v = 0.5 * (self.seg_solver.v_minus[i] + self.seg_solver.v_plus[i])
+                if v.norm() < slow_threshold:
+                    keep = False
+            if keep and enable_weak == 1 and not skip:
+                if ti.abs(self.ss_seg.gamma[i]) < gamma_threshold:
+                    keep = False
+            if keep and has_outflow == 1 and not skip and center[0] > outflow_x:
+                keep = False
+            if keep and has_max_age == 1 and self.ss_seg.age[i] > max_age:
+                keep = False
+            if keep and delete_outside == 1 and not skip:
+                xm = self.ss_seg.x_minus[i]
+                xp = self.ss_seg.x_plus[i]
+                inside_domain = (
+                    xm[0] >= lo0 and xm[0] <= hi0 and xm[1] >= lo1 and xm[1] <= hi1 and xm[2] >= lo2 and xm[2] <= hi2
+                    and xp[0] >= lo0 and xp[0] <= hi0 and xp[1] >= lo1 and xp[1] <= hi1 and xp[2] >= lo2 and xp[2] <= hi2
+                )
+                if inside_domain == False:
+                    keep = False
+            if keep:
+                j = ti.atomic_add(self.seg_solver._compact_counter[None], 1)
+                self.seg_solver._compact_x_minus[j] = self.ss_seg.x_minus[i]
+                self.seg_solver._compact_x_plus[j] = self.ss_seg.x_plus[i]
+                self.seg_solver._compact_gamma[j] = self.ss_seg.gamma[i]
+                self.seg_solver._compact_age[j] = self.ss_seg.age[i]
+                self.seg_solver._compact_seg_type[j] = self.ss_seg.seg_type[i]
+                self.seg_solver._compact_sph_advect_velocity_minus[j] = self.seg_solver.sph_advect_velocity_minus[i]
+                self.seg_solver._compact_sph_advect_velocity_plus[j] = self.seg_solver.sph_advect_velocity_plus[i]
+                self.seg_solver._compact_initial_sph_advect_remaining[j] = self.seg_solver.initial_sph_advect_remaining[i]
+                self.seg_solver._compact_point_vortex_volume[j] = self.seg_solver.point_vortex_volume[i]
+
+    @ti.kernel
+    def _combined_delete_point_vortices_gpu_kernel(
+        self, n: ti.i32, delete_inside: ti.i32, delete_slow: ti.i32, enable_weak: ti.i32,
+        gamma_threshold: float, slow_threshold: float, boundary_type: ti.i32,
+        inside_a: ti.i32, inside_b: ti.i32, inside_c: ti.i32, inside_d: ti.i32,
+        slow_a: ti.i32, slow_b: ti.i32, slow_c: ti.i32, slow_d: ti.i32,
+        block_count: ti.i32,
+        b0x0: float, b0y0: float, b0x1: float, b0y1: float,
+        b1x0: float, b1y0: float, b1x1: float, b1y1: float,
+        b2x0: float, b2y0: float, b2x1: float, b2y1: float,
+        b3x0: float, b3y0: float, b3x1: float, b3y1: float,
+        cyl_count: ti.i32,
+        c0x: float, c0y: float, c0r: float, c1x: float, c1y: float, c1r: float,
+        c2x: float, c2y: float, c2r: float, c3x: float, c3y: float, c3r: float,
+        has_outflow: ti.i32, outflow_x: float, has_max_age: ti.i32, max_age: float,
+        delete_outside: ti.i32, lo0: float, lo1: float, hi0: float, hi1: float,
+        skip_a: ti.i32, skip_b: ti.i32, skip_c: ti.i32, skip_d: ti.i32,
+    ):
+        for i in range(n):
+            st = self.ss_seg.seg_type[i]
+            skip = (st == skip_a) or (st == skip_b) or (st == skip_c) or (st == skip_d)
+            keep = self.ss_seg.active[i] == 1
+            center = 0.5 * (self.ss_seg.x_minus[i] + self.ss_seg.x_plus[i])
+            target_inside = (st == inside_a) or (st == inside_b) or (st == inside_c) or (st == inside_d)
+            target_slow = (st == slow_a) or (st == slow_b) or (st == slow_c) or (st == slow_d)
+            if keep and delete_inside == 1 and target_inside:
+                inside = False
+                if block_count >= 1:
+                    inside = inside or (center[0] >= b0x0 and center[0] <= b0x1 and center[1] >= b0y0 and center[1] <= b0y1)
+                if block_count >= 2:
+                    inside = inside or (center[0] >= b1x0 and center[0] <= b1x1 and center[1] >= b1y0 and center[1] <= b1y1)
+                if block_count >= 3:
+                    inside = inside or (center[0] >= b2x0 and center[0] <= b2x1 and center[1] >= b2y0 and center[1] <= b2y1)
+                if block_count >= 4:
+                    inside = inside or (center[0] >= b3x0 and center[0] <= b3x1 and center[1] >= b3y0 and center[1] <= b3y1)
+                if cyl_count >= 1:
+                    dx = center[0] - c0x; dy = center[1] - c0y
+                    inside = inside or (dx * dx + dy * dy <= c0r * c0r)
+                if cyl_count >= 2:
+                    dx = center[0] - c1x; dy = center[1] - c1y
+                    inside = inside or (dx * dx + dy * dy <= c1r * c1r)
+                if cyl_count >= 3:
+                    dx = center[0] - c2x; dy = center[1] - c2y
+                    inside = inside or (dx * dx + dy * dy <= c2r * c2r)
+                if cyl_count >= 4:
+                    dx = center[0] - c3x; dy = center[1] - c3y
+                    inside = inside or (dx * dx + dy * dy <= c3r * c3r)
+                if inside:
+                    keep = False
+            if keep and delete_slow == 1 and target_slow and st != boundary_type:
+                v = 0.5 * (self.seg_solver.v_minus[i] + self.seg_solver.v_plus[i])
+                if v.norm() < slow_threshold:
+                    keep = False
+            if keep and enable_weak == 1 and not skip:
+                if ti.abs(self.ss_seg.gamma[i]) < gamma_threshold:
+                    keep = False
+            if keep and has_outflow == 1 and not skip and center[0] > outflow_x:
+                keep = False
+            if keep and has_max_age == 1 and self.ss_seg.age[i] > max_age:
+                keep = False
+            if keep and delete_outside == 1 and not skip:
+                xm = self.ss_seg.x_minus[i]
+                xp = self.ss_seg.x_plus[i]
+                inside_domain = xm[0] >= lo0 and xm[0] <= hi0 and xm[1] >= lo1 and xm[1] <= hi1 and xp[0] >= lo0 and xp[0] <= hi0 and xp[1] >= lo1 and xp[1] <= hi1
+                if inside_domain == False:
+                    keep = False
+            if keep:
+                j = ti.atomic_add(self.seg_solver._compact_counter[None], 1)
+                self.seg_solver._compact_x_minus[j] = self.ss_seg.x_minus[i]
+                self.seg_solver._compact_x_plus[j] = self.ss_seg.x_plus[i]
+                self.seg_solver._compact_gamma[j] = self.ss_seg.gamma[i]
+                self.seg_solver._compact_age[j] = self.ss_seg.age[i]
+                self.seg_solver._compact_seg_type[j] = self.ss_seg.seg_type[i]
+                self.seg_solver._compact_sph_advect_velocity_minus[j] = self.seg_solver.sph_advect_velocity_minus[i]
+                self.seg_solver._compact_sph_advect_velocity_plus[j] = self.seg_solver.sph_advect_velocity_plus[i]
+                self.seg_solver._compact_initial_sph_advect_remaining[j] = self.seg_solver.initial_sph_advect_remaining[i]
+                self.seg_solver._compact_point_vortex_volume[j] = self.seg_solver.point_vortex_volume[i]
+
+    def _sync_moving_cylinder_to_segment_config(self):
+        """Sync the SPH cylinder's current position into the segment config dict.
+
+        When the cylinder is oscillating/translating (``cylinderOscillationEnabled``),
+        the segment subsystem reads obstacle circle centers from the static JSON
+        config (``boundaryCircleCenter``, ``Cylinders``, ``imageSegmentPanelCircleCenter``).
+        Without this sync, segment deletion (``deleteInsideObstacleIncludeBoundaryCircle``)
+        and the segment-panel circle overlay would stay pinned at the rest position
+        while the SPH cylinder has already moved.
+
+        This updates those config entries in-place so every per-step read picks up
+        the live center ``circle_pos + _cylinder_current_offset``.
+        """
+        if not getattr(self, "_cylinder_oscillation_enabled", False):
+            return
+        offset = getattr(self, "_cylinder_current_offset", None)
+        if offset is None:
+            return
+        dim = int(self.ps.dim)
+        cur = self.circle_pos[:dim] + offset[:dim]
+        cx, cy = float(cur[0]), float(cur[1])
+        seg_dict = self.seg_cfg.config.get("SegmentConfiguration", None)
+        if seg_dict is not None:
+            seg_dict["boundaryCircleCenter"] = [cx, cy]
+            seg_dict["imageSegmentPanelCircleCenter"] = [cx, cy]
+        cylinders = self.seg_cfg.config.get("Cylinders", None)
+        if cylinders:
+            c = list(cylinders[0].get("center", [0.0, 0.0, 0.0]))
+            while len(c) < 3:
+                c.append(0.0)
+            c[0] = cx
+            c[1] = cy
+            cylinders[0]["center"] = c
+
     def _advance_segments_coupled(self):
         ssol = self.seg_solver
         timing = self._segment_timing_enabled and (
@@ -1144,6 +2091,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     int(self._sph_velocity_to_segment_skip_type),
                 )
 
+        run_stage("sync_moving_cylinder", self._sync_moving_cylinder_to_segment_config)
         run_stage("boundary_pipeline", boundary_pipeline)
         run_stage("periodic_emit", periodic_emit)
         run_stage("residual_vorticity_injection", residual_vorticity_injection)
@@ -1191,13 +2139,21 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     ),
                 )
             run_stage("update_segment_geometry_post", ssol.ss.update_segment_geometry)
-            run_stage("delete_inside_obstacles", self._delete_interior_segments_inside_obstacles)
-            run_stage("delete_slow_point_vortices", self._delete_slow_internal_point_vortices)
+            combined_delete_done = False
+            if bool(self.seg_cfg.get_cfg("enableGpuDeleteCompact", False)):
+                def combined_delete_point_vortices():
+                    nonlocal combined_delete_done
+                    combined_delete_done = self._try_combined_gpu_delete_point_vortices()
+                run_stage("combined_delete_point_vortices", combined_delete_point_vortices)
+            if not combined_delete_done:
+                run_stage("delete_inside_obstacles", self._delete_interior_segments_inside_obstacles)
+                run_stage("delete_slow_point_vortices", self._delete_slow_internal_point_vortices)
             if not getattr(ssol, "_bs_2d_point", False):
                 run_stage("split_segments", ssol.split_segments)
                 run_stage("merge_segments", ssol.merge_segments)
                 run_stage("restore_frozen_segment_geometry", ssol.restore_frozen_segment_geometry)
-            run_stage("delete_weak_segments", ssol.delete_weak_segments)
+            if (not combined_delete_done) or (combined_delete_done and not getattr(ssol, "_bs_2d_point", False)):
+                run_stage("delete_weak_segments", ssol.delete_weak_segments)
             if sph_advect_bs_ghost:
                 old_bg = int(ssol._segment_advect_use_background[None])
                 old_sph = int(ssol._segment_advect_use_sph[None])
@@ -2391,7 +3347,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         material = self.ps.material.to_numpy()[:N]
         obj_id = self.ps.object_id.to_numpy()[:N]
         fluid_mask = material == self.ps.material_fluid
-        solid_mask = (obj_id == 1) | (obj_id == 2)
+        solid_mask = (obj_id == 2)
 
         x = self.x_temp.to_numpy()[:N]
         vort = self.ps.vorticity_vis.to_numpy()[:N][:, 2]

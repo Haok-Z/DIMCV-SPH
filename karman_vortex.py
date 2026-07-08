@@ -78,6 +78,16 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             )
         self._cylinder_linear_velocity = self._cylinder_linear_velocity[: self.ps.dim]
 
+        # When true (linear mode only), clamp the cylinder translation so its
+        # center stops at the position symmetric to circle_pos about the domain
+        # center:  stop = domain_start + domain_end - circle_pos.
+        self._cylinder_linear_stop_at_symmetric = bool(
+            cfg_get("cylinderLinearStopAtSymmetric", False)
+        )
+        # Current applied offset (after clamping); other subsystems (e.g. the
+        # segment hybrid solver) read this to sync obstacle geometry.
+        self._cylinder_current_offset = np.zeros(self.ps.dim, dtype=np.float64)
+
     @ti.kernel
     def init_circle(self):
         for p in range(self.ps.particle_num[None]):
@@ -153,19 +163,40 @@ class KarmanVortexSolver(DIMCVSPHSolver):
 
     def _update_oscillating_cylinder(self):
         if not self._cylinder_oscillation_enabled:
+            self._cylinder_current_offset[: self.ps.dim] = 0.0
             return
         t = float(self.cnt) * float(self.dt[None])
         if t < self._cylinder_oscillation_start_time:
+            self._cylinder_current_offset[: self.ps.dim] = 0.0
             return
         tau = t - self._cylinder_oscillation_start_time
         if self._cylinder_motion_mode in ("linear", "translate", "translation"):
             offset = tau * self._cylinder_linear_velocity
-            vel = self._cylinder_linear_velocity
+            vel = self._cylinder_linear_velocity.copy()
+            if self._cylinder_linear_stop_at_symmetric:
+                # Symmetric stop position about the domain center:
+                #   stop = domain_start + domain_end - circle_pos
+                #   max_offset = stop - circle_pos
+                #             = (domain_start + domain_end) - 2 * circle_pos
+                # Clamp the offset so the cylinder center does not travel past
+                # the symmetric position; zero the velocity once it arrives.
+                max_offset = (
+                    self.ps.domain_start + self.ps.domain_end
+                ) - 2.0 * self.circle_pos
+                for d in range(self.ps.dim):
+                    if abs(max_offset[d]) > 1e-12:
+                        if max_offset[d] > 0.0 and offset[d] >= max_offset[d]:
+                            offset[d] = max_offset[d]
+                            vel[d] = 0.0
+                        elif max_offset[d] < 0.0 and offset[d] <= max_offset[d]:
+                            offset[d] = max_offset[d]
+                            vel[d] = 0.0
         else:
             omega = 2.0 * np.pi / self._cylinder_oscillation_period
             amp = self._cylinder_oscillation_amplitude
             offset = amp * np.sin(omega * tau) * self._cylinder_oscillation_axis
             vel = amp * omega * np.cos(omega * tau) * self._cylinder_oscillation_axis
+        self._cylinder_current_offset[: self.ps.dim] = offset[: self.ps.dim]
         off3 = np.zeros((3,), dtype=np.float64)
         vel3 = np.zeros((3,), dtype=np.float64)
         off3[: self.ps.dim] = offset[: self.ps.dim]

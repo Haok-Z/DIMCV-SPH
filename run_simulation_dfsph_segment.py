@@ -37,7 +37,7 @@ def main():
         help="JSON with Configuration + SegmentConfiguration. "
         "Emit-only experiment: DIM_von_karman_vortex_2d_dfsph_segment_emit_bs.json",
     )
-    image_path = Path("result_images_dfsph_seg_velocity_07")
+    image_path = Path("result_images_dfsph_seg_velocity_09")
     if image_path.exists():
         for p in image_path.iterdir():
             if p.is_file():
@@ -61,7 +61,7 @@ def main():
     export_ply = bool(export_ply) if export_ply is not None else False
     ply_path = None
     if export_ply:
-        ply_path = Path("result_ply_dfsph_seg_velocity_07")
+        ply_path = Path("result_ply_dfsph_seg_velocity_09")
         if ply_path.exists():
             for p in ply_path.iterdir():
                 if p.is_file():
