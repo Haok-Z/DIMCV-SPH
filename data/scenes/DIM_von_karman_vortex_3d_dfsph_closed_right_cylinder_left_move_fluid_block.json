@@ -1,0 +1,152 @@
+{
+  "Configuration": {
+    "domainStart": [0.0, 0.0, 0.0],
+    "domainEnd": [4.0, 1.0, 1.0],
+    "deleteFluidParticlesOutsideDomain": true,
+    "domainCullMargin": 0.0,
+    "particleRadius": 0.0045,
+    "numberOfStepsPerRenderUpdate": 1,
+    "density0": 1000,
+    "simulationMethod": 1,
+    "gravitation": [0.0, 0.0, -9.8],
+    "timeStepSize": 0.002,
+    "stiffness": 50000,
+    "exponent": 7,
+    "boundaryHandlingMethod": 0,
+    "bounceBackBoundary": false,
+    "simulationTime": 12.0,
+    "vortexEnforcingDomainStart": [0.2, 0.0, 0.0],
+    "vortexEnforcingDomainEnd": [4.0, 1.0, 1.0],
+    "volumeScale": 0.2,
+    "GenProbPara": 5,
+    "DelProbPara": 3.5,
+    "reservedCapacity": 2400000,
+    "windowRes": [2048, 512, 512],
+    "divergenceTransitArea": [0.0, 0.02, 0.02],
+    "invisibleObjects": [1],
+    "exportPLY": true,
+    "exportPLYAxisConvention": "z_up",
+    "cylinderCenter": [3.9, 0.5, 0.45],
+    "cylinderRadius": 0.06,
+    "emitStopFluidParticleNum": 1650000,
+    "emitStopStep": 0,
+    "cylinderOscillationEnabled": true,
+    "cylinderOscillationObjectId": 2,
+    "cylinderOscillationStartTime": 1,
+    "cylinderMotionMode": "linear",
+    "cylinderLinearVelocity": [-2.0, 0.0, 0.0],
+    "cylinderLinearStopAtSymmetric": true,
+    "cylinderOscillationAxis": [1.0, 0.0, 0.0],
+    "cylinderOscillationAmplitude": 0.0,
+    "cylinderOscillationPeriod": 2.0,
+    "imageVorticityAutoScale": false,
+    "imageVorticityVmin": -40,
+    "imageVorticityVmax": 40,
+    "imageFluidPointSize": 1.0,
+    "imageFluidAlpha": 1,
+    "vorticityLossUsePredictedOmega": true
+  },
+  "FluidBlocks": [
+    {
+      "objectId": 3,
+      "start": [0.029, 0.029, 0.029],
+      "end": [3.831, 0.971, 0.3333333333333333],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [50, 100, 200]
+    }
+  ],
+  "FluidEmitters": [
+    {
+      "objectId": 0,
+      "squareCenter": [0.1, 0.5, 0.2],
+      "squareSize": [0.0, 0.9, 0.3],
+      "velocity": [2.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [50, 100, 200]
+    }
+  ],
+  "RigidBlocks": [
+    {
+      "objectId": 1,
+      "start": [0.0, 0.0, 0.0],
+      "end": [4.0, 1.0, 0.02],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [0.0, 0.0, 0.0],
+      "end": [4.0, 0.02, 1.0],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [0.0, 0.98, 0.0],
+      "end": [4.0, 1.0, 1.0],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [0.0, 0.02, 0.0],
+      "end": [0.02, 0.98, 1.0],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [3.98, 0.02, 0.0],
+      "end": [4.0, 0.98, 1.0],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    },
+    {
+      "objectId": 2,
+      "start": [3.828, 0.428, 0.0],
+      "end": [3.973000002, 0.573000002, 0.9],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [201, 112, 100],
+      "isDynamic": false
+    }
+  ],
+  "Cylinders": [
+    {
+      "objectId": 10,
+      "center": [3.9, 0.5, 0.45],
+      "radius": 0.06,
+      "height": 0.9,
+      "axis": [0.0, 0.0, 1.0],
+      "velocity": [0.0, 0.0, 0.0],
+      "density": 1000.0,
+      "color": [120, 120, 120],
+      "isDynamic": false
+    }
+  ]
+}

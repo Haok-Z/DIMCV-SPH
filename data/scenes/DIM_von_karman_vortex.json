@@ -24,7 +24,8 @@
 		"reservedCapacity": 1000000,
         "windowRes": [2048,512,512],
 		"divergenceTransitArea": [0.0,0.02,0.02],
-		"invisibleObjects":[1,2,2],
+		"invisibleObjects":[1],
+		"cylinderRadius": 0.06,
         "exportPLY": true,
 		"exportPLYAxisConvention": "y_up"
 	},

@@ -407,7 +407,13 @@ class ParticleSystem:
 
     @ti.func
     def pos_to_index(self, pos):
-        return (pos / self.grid_size).cast(int)
+        index = (pos / self.grid_size).cast(int)
+        # Solids can temporarily touch or slightly exceed the domain while a
+        # kinematic body enters/leaves through a boundary opening. Clamp the
+        # hash cell so such particles cannot write outside grid fields.
+        for d in ti.static(range(self.dim)):
+            index[d] = ti.max(0, ti.min(index[d], self.grid_num[d] - 1))
+        return index
 
     @ti.func
     def flatten_grid_index_2d(self, grid_index):

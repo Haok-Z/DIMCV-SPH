@@ -37,7 +37,7 @@ def main():
         default="./data/scenes/DIM_von_karman_vortex_dfsph.json",
         help="Scene JSON; must use simulationMethod 1 for DFSPH-only solver",
     )
-    image_path = Path("result_images_dfsph")
+    image_path = Path("result_images_dfsph_3D_2")
     if image_path.exists():
         for p in image_path.iterdir():
             if p.is_file():
@@ -61,7 +61,7 @@ def main():
     export_ply = bool(export_ply) if export_ply is not None else False
     ply_path = None
     if export_ply:
-        ply_path = Path("result_ply_dfsph")
+        ply_path = Path("result_ply_dfsph_3D_2")
         if ply_path.exists():
             for p in ply_path.iterdir():
                 if p.is_file():

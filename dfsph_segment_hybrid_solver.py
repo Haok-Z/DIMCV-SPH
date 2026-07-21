@@ -3338,6 +3338,15 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         dir_seg = path_base / self._export_seg_subdir
         dir_sph.mkdir(parents=True, exist_ok=True)
         dir_seg.mkdir(parents=True, exist_ok=True)
+        ds = self.ps.domain_start
+        de = self.ps.domain_end
+        domain_extent = de - ds
+        fig_width = 12.0
+        fig_height = max(
+            2.0,
+            min(4.0, fig_width * max(float(domain_extent[1]), float(domain_extent[2])) /
+                max(float(domain_extent[0]), 1e-12)),
+        )
 
         vnorm = Normalize(
             vmin=self._img_vort_vmin, vmax=self._img_vort_vmax
@@ -3357,7 +3366,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         solid_x = x[solid_mask]
 
         # --- [EXPORT] SPH 粒子图（无涡段）---
-        fig = plt.figure(figsize=(10, 4), dpi=200)
+        fig = plt.figure(figsize=(fig_width, fig_height), dpi=200)
         ax = fig.add_subplot(111, projection="3d")
         ax.view_init(elev=30, azim=-60)
         ax.scatter(
@@ -3379,10 +3388,10 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             s=0.5,
             edgecolors="none",
         )
-        ax.set_xlim(0, 4)
-        ax.set_ylim(0, 1)
-        ax.set_zlim(0, 1)
-        ax.set_box_aspect((4, 1, 1))
+        ax.set_xlim(float(ds[0]), float(de[0]))
+        ax.set_ylim(float(ds[1]), float(de[1]))
+        ax.set_zlim(float(ds[2]), float(de[2]))
+        ax.set_box_aspect(tuple(float(v) for v in domain_extent))
         ax.set_axis_off()
         plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
         plt.savefig(
@@ -3398,7 +3407,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         # --- [EXPORT] 涡段图（按段心涡量 z 分量着色，色标与 SPH 一致）---
         if self._export_segment_panel:
             n_seg = int(self.ss_seg.segment_num[None])
-            fig2 = plt.figure(figsize=(10, 4), dpi=200)
+            fig2 = plt.figure(figsize=(fig_width, fig_height), dpi=200)
             ax2 = fig2.add_subplot(111, projection="3d")
             ax2.view_init(elev=30, azim=-60)
             if self._segment_panel_include_solid and solid_x.shape[0] > 0:
@@ -3420,10 +3429,10 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     seg_norm = self._segment_gamma_color_norm(scalars)
                     self._add_interior_segments_3d(ax2, xm, xp, idx_int, scalars, seg_norm)
                 self._add_boundary_segments_3d(ax2, xm, xp, idx_bnd)
-            ax2.set_xlim(0, 4)
-            ax2.set_ylim(0, 1)
-            ax2.set_zlim(0, 1)
-            ax2.set_box_aspect((4, 1, 1))
+            ax2.set_xlim(float(ds[0]), float(de[0]))
+            ax2.set_ylim(float(ds[1]), float(de[1]))
+            ax2.set_zlim(float(ds[2]), float(de[2]))
+            ax2.set_box_aspect(tuple(float(v) for v in domain_extent))
             ax2.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
             plt.savefig(

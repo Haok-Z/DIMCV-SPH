@@ -47,7 +47,7 @@
     "backgroundVelocity": [0.0, 0.0, 0.0],
     "segmentAdvectionBackgroundVelocity": [0.0, 0.0, 0.0],
     "boundaryTangentReferenceVelocity": [0.0, 0.0, 0.0],
-    "gammaDecay": 1.0,
+    "gammaDecay": 0.94,
 
     "splitLengthThreshold": 0.12,
     "mergeDistanceLambda": 0.008,

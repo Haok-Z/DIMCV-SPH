@@ -16,7 +16,7 @@ ti.init(arch=ti.cuda,
 def main():
     parser = argparse.ArgumentParser(description='Dynamic Importance Monte Carlo Vortical SPH')
     parser.add_argument('--scene_file', default='', help='scene file')
-    image_path = Path("result_images")
+    image_path = Path("result_images_DIMCV_3D_2")
     # Clean previous PNGs
     if image_path.exists():
         for p in image_path.iterdir():
@@ -32,7 +32,7 @@ def main():
     export_ply = bool(export_ply) if export_ply is not None else False
     ply_path = None
     if export_ply:
-        ply_path = Path("result_ply")
+        ply_path = Path("result_ply_DIMCV_3D_2")
         # Clean previous PLYs
         if ply_path.exists():
             for p in ply_path.iterdir():

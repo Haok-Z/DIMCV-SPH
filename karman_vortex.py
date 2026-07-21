@@ -11,14 +11,21 @@ class KarmanVortexSolver(DIMCVSPHSolver):
 
     def __init__(self, particle_system):
         super().__init__(particle_system)
-        cc = self.ps.cfg.get_cfg("cylinderCenter", None)
+        cfg_dict = getattr(self.ps.cfg, "config", {}).get("Configuration", {})
+
+        def cfg_get(name, default=None):
+            return cfg_dict.get(name, default)
+
+        # Mesh obstacles can share the legacy motion schedule without being
+        # clipped to the circular proxy used by the Karman cylinder scenes.
+        cc = cfg_get("movingRigidStartCenter", cfg_get("cylinderCenter", None))
         if cc is not None:
             self.circle_pos = np.array(cc, dtype=np.float64)
         elif self.ps.dim == 2:
             self.circle_pos = np.array([0.65, 0.5], dtype=np.float64)
         else:
             self.circle_pos = np.array([0.65, 0.5, 0.5], dtype=np.float64)
-        _cr = self.ps.cfg.get_cfg("cylinderRadius")
+        _cr = cfg_get("cylinderRadius", None)
         self.circle_radius = float(_cr if _cr is not None else 0.1)
         self.circle_vis = ti.Vector.field(self.ps.dim, dtype=float, shape=1)
         if self.ps.dim == 2:
@@ -28,11 +35,14 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             self.circle_vis[0] = ti.Vector([
                 self.circle_pos[0] * 0.25, self.circle_pos[1], self.circle_pos[2]
             ])
-        self.init_cylinder()
-        cfg_dict = getattr(self.ps.cfg, "config", {}).get("Configuration", {})
-
-        def cfg_get(name, default=None):
-            return cfg_dict.get(name, default)
+        self._cylinder_obstacle_enabled = bool(
+            cfg_get("cylinderObstacleEnabled", True)
+        )
+        self._moving_rigid_object_full_body = bool(
+            cfg_get("movingRigidObjectFullBody", False)
+        )
+        if self._cylinder_obstacle_enabled:
+            self.init_cylinder()
         self._emit_stop_step = cfg_get("emitStopStep", None)
         self._emit_stop_time = cfg_get("emitStopTime", None)
         self._emit_stop_fluid_particle_num = cfg_get("emitStopFluidParticleNum", None)
@@ -149,6 +159,22 @@ class KarmanVortexSolver(DIMCVSPHSolver):
                         self.ps.x[p][d] = 0.0
                         self.ps.v[p][d] = 0.0
 
+    @ti.kernel
+    def _translate_whole_object_from_rest_kernel(
+        self, object_id: ti.i32, off0: float, off1: float, off2: float,
+        vel0: float, vel1: float, vel2: float,
+    ):
+        """Move every particle of a mesh/rigid object without proxy clipping."""
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.object_id[p] == object_id:
+                self.ps.is_active[p] = 1
+                if ti.static(self.ps.dim == 2):
+                    self.ps.x[p] = self.ps.x_0[p] + ti.Vector([off0, off1])
+                    self.ps.v[p] = ti.Vector([vel0, vel1])
+                else:
+                    self.ps.x[p] = self.ps.x_0[p] + ti.Vector([off0, off1, off2])
+                    self.ps.v[p] = ti.Vector([vel0, vel1, vel2])
+
     def _should_emit_this_step(self) -> bool:
         if self._emit_stop_step is not None and int(self.cnt) >= int(self._emit_stop_step):
             return False
@@ -201,7 +227,12 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         vel3 = np.zeros((3,), dtype=np.float64)
         off3[: self.ps.dim] = offset[: self.ps.dim]
         vel3[: self.ps.dim] = vel[: self.ps.dim]
-        self._translate_object_from_rest_kernel(
+        translate = (
+            self._translate_whole_object_from_rest_kernel
+            if self._moving_rigid_object_full_body
+            else self._translate_object_from_rest_kernel
+        )
+        translate(
             self._cylinder_oscillation_object_id,
             float(off3[0]), float(off3[1]), float(off3[2]),
             float(vel3[0]), float(vel3[1]), float(vel3[2]),
@@ -212,8 +243,12 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         material = self.ps.material.to_numpy()[:N]
         obj_id = self.ps.object_id.to_numpy()[:N]
         fluid_mask = (material == self.ps.material_fluid)
-        # 刚体块 objectId=1（通道壁）与圆柱 objectId=2 均以绿色叠加显示
+        # Render the channel walls/cylinder unless the scene hides an object id.
+        invisible_objects = self.ps.cfg.get_cfg("invisibleObjects") or []
+        invisible_ids = np.asarray(invisible_objects, dtype=obj_id.dtype)
         solid_mask = (obj_id == 1) | (obj_id == 2)
+        if invisible_ids.size > 0:
+            solid_mask &= ~np.isin(obj_id, invisible_ids)
 
         x = self.x_temp.to_numpy()[:N]
         vort_np = self.ps.vorticity_vis.to_numpy()[:N]
@@ -270,7 +305,14 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             plt.close("all")
             return
 
-        fig = plt.figure(figsize=(10, 4), dpi=200)
+        domain_extent = de - ds
+        fig_width = 12.0
+        fig_height = max(
+            2.0,
+            min(4.0, fig_width * max(float(domain_extent[1]), float(domain_extent[2])) /
+                max(float(domain_extent[0]), 1e-12)),
+        )
+        fig = plt.figure(figsize=(fig_width, fig_height), dpi=200)
         ax = fig.add_subplot(111, projection='3d')
         ax.view_init(elev=30, azim=-60)
         sc = ax.scatter(fluid_x[:, 0],
@@ -289,10 +331,10 @@ class KarmanVortexSolver(DIMCVSPHSolver):
                    s=0.5,
                    edgecolors='none')
 
-        ax.set_xlim(0, 4)
-        ax.set_ylim(0, 1)
-        ax.set_zlim(0, 1)
-        ax.set_box_aspect((4, 1, 1))
+        ax.set_xlim(float(ds[0]), float(de[0]))
+        ax.set_ylim(float(ds[1]), float(de[1]))
+        ax.set_zlim(float(ds[2]), float(de[2]))
+        ax.set_box_aspect(tuple(float(v) for v in domain_extent))
         ax.set_axis_off()  # 如果想看坐标轴可以注释掉这一行
         plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
@@ -449,7 +491,12 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         # Cull out-of-domain fluid and compact first so emit sees freed slots.
         self.ps.initialize_particle_system()
         if self._cylinder_oscillation_enabled:
-            self._translate_object_from_rest_kernel(
+            reset_translation = (
+                self._translate_whole_object_from_rest_kernel
+                if self._moving_rigid_object_full_body
+                else self._translate_object_from_rest_kernel
+            )
+            reset_translation(
                 self._cylinder_oscillation_object_id,
                 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0,
