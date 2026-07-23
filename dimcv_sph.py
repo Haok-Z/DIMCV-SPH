@@ -1,6 +1,7 @@
 import taichi as ti
 from sph_base import SPHBase
 import numpy as np
+import time
 
 
 @ti.data_oriented
@@ -26,6 +27,17 @@ class DIMCVSPHSolver(SPHBase):
         self.max_error = 0.05
         self.inv_dt = 1.0 / self.dt[None]
         self.inv_dt2 = 1.0 / (self.dt[None] * self.dt[None])
+        cfg_values = getattr(self.ps.cfg, "config", {}).get("Configuration", {})
+        self._pressure_timing_enabled = bool(
+            cfg_values.get("debugDFSPHPressureTiming", False)
+        )
+        self._pressure_timing_interval = max(
+            1, int(cfg_values.get("debugDFSPHPressureTimingInterval", 10))
+        )
+        self._pressure_timing_sync = bool(
+            cfg_values.get("debugDFSPHPressureTimingSync", True)
+        )
+        self._pressure_solve_call_count = 0
 
         self.d_vort = ti.Vector.field(3,
                                       dtype=float,
@@ -647,22 +659,92 @@ class DIMCVSPHSolver(SPHBase):
 
     def pressure_solve(self):
         inv_dt2 = self.inv_dt2
+        self._pressure_solve_call_count += 1
+        timing = self._pressure_timing_enabled and (
+            self._pressure_solve_call_count % self._pressure_timing_interval == 0
+        )
+
+        if not timing:
+            # Compute rho_adv
+            self.compute_density_adv()
+            self.multiply_time_step(self.ps.dfsph_factor, inv_dt2)
+            m_iterations = 0
+
+            # Start solver
+            avg_density_err = 0.0
+
+            while m_iterations < 1 or m_iterations < self.m_max_iterations:
+                avg_density_err = self.pressure_solve_iteration()
+                # Max allowed density fluctuation
+                eta = self.max_error * 0.01 * self.density_0
+                m_iterations += 1
+                if avg_density_err <= eta:
+                    break
+            return
+
+        records = []
+
+        def run_stage(name, fn):
+            if self._pressure_timing_sync:
+                ti.sync()
+            t0 = time.perf_counter()
+            result = fn()
+            if self._pressure_timing_sync:
+                ti.sync()
+            records.append((name, (time.perf_counter() - t0) * 1000.0))
+            return result
 
         # Compute rho_adv
-        self.compute_density_adv()
-        self.multiply_time_step(self.ps.dfsph_factor, inv_dt2)
+        run_stage("initial_density_adv", self.compute_density_adv)
+        run_stage(
+            "scale_dfsph_factor",
+            lambda: self.multiply_time_step(self.ps.dfsph_factor, inv_dt2),
+        )
         m_iterations = 0
 
         # Start solver
         avg_density_err = 0.0
+        eta = self.max_error * 0.01 * self.density_0
 
         while m_iterations < 1 or m_iterations < self.m_max_iterations:
-            avg_density_err = self.pressure_solve_iteration()
-            # Max allowed density fluctuation
-            eta = self.max_error * 0.01 * self.density_0
+            run_stage("pressure_iteration_kernel", self.pressure_solve_iteration_kernel)
+            run_stage("density_adv", self.compute_density_adv)
+            density_err = run_stage(
+                "density_error_reduction",
+                lambda: self.compute_density_error(self.density_0),
+            )
+            n_fluid = int(self.ps.fluid_particle_num[None])
+            avg_density_err = density_err / n_fluid if n_fluid > 0 else 0.0
             m_iterations += 1
             if avg_density_err <= eta:
                 break
+
+        total = sum(ms for _, ms in records)
+        pressure_ms = sum(
+            ms for name, ms in records if name == "pressure_iteration_kernel"
+        )
+        density_adv_ms = sum(ms for name, ms in records if name == "density_adv")
+        reduction_ms = sum(
+            ms for name, ms in records if name == "density_error_reduction"
+        )
+        initial_density_adv_ms = sum(
+            ms for name, ms in records if name == "initial_density_adv"
+        )
+        scale_factor_ms = sum(
+            ms for name, ms in records if name == "scale_dfsph_factor"
+        )
+        iteration_ms = pressure_ms + density_adv_ms + reduction_ms
+        print(
+            f"[dfsph-pressure-timing] call={self._pressure_solve_call_count} "
+            f"fluid={n_fluid} iterations={m_iterations}/{self.m_max_iterations} "
+            f"final_avg_density_error={avg_density_err:.6e} eta={eta:.6e} "
+            f"total={total:.3f}ms initial_density_adv={initial_density_adv_ms:.3f}ms "
+            f"scale_factor={scale_factor_ms:.3f}ms "
+            f"iter_total={iteration_ms:.3f}ms/{iteration_ms / m_iterations:.3f}ms "
+            f"pressure_kernel={pressure_ms:.3f}ms/{pressure_ms / m_iterations:.3f}ms "
+            f"density_adv={density_adv_ms:.3f}ms/{density_adv_ms / m_iterations:.3f}ms "
+            f"reduction={reduction_ms:.3f}ms/{reduction_ms / m_iterations:.3f}ms"
+        )
 
     def emit_particle(self):
         for emitter in self.ps.fluid_emitters:

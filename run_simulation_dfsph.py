@@ -21,7 +21,7 @@ import time
 
 ti.init(
     arch=ti.cuda,
-    device_memory_fraction=0.5,
+    device_memory_fraction=1,
     debug=False,
     random_seed=int(time.time()),
     kernel_profiler=False,
