@@ -67,6 +67,8 @@ class ParticleSystem:
 
         self.particle_num = ti.field(int, shape=())
         self.particle_num[None] = 0
+        self.active_particle_num = ti.field(int, shape=())
+        self.active_particle_num[None] = 0
 
         # Grid related properties
         self.grid_size = self.support_radius
@@ -446,7 +448,9 @@ class ParticleSystem:
     def update_activity(self):
         for i in range(self.particle_num[None]):
             if self.material[i] == self.material_solid:
-                self.is_active[i] = 1
+                # A solver may intentionally deactivate a legacy proxy
+                # particle. Do not silently revive it during compaction.
+                continue
             elif self.material[i] == self.material_fluid:
                 if self._cull_fluid_domain[None] != 1:
                     continue
@@ -467,10 +471,10 @@ class ParticleSystem:
 
     @ti.kernel
     def particle_partition(self):
-        new_idx = 0
+        self.active_particle_num[None] = 0
         for i in range(self.particle_num[None]):
             if self.is_active[i] == 1:
-                new_idx_temp = ti.atomic_add(new_idx, 1)
+                new_idx_temp = ti.atomic_add(self.active_particle_num[None], 1)
                 self.grid_ids_buffer[new_idx_temp] = self.grid_ids[i]
                 self.object_id_buffer[new_idx_temp] = self.object_id[i]
                 self.x_0_buffer[new_idx_temp] = self.x_0[i]
@@ -503,8 +507,9 @@ class ParticleSystem:
         self.is_sample.fill(0)
         self.life_time.fill(0)
 
-        self.particle_num[None] = self.fluid_particle_num[
-            None] + self.solid_particle_num[None]
+        # Use the count that was actually copied.  The old bookkeeping-based
+        # count could copy stale buffer entries when any solid was inactive.
+        self.particle_num[None] = self.active_particle_num[None]
         for i in range(self.particle_num[None]):
             self.grid_ids[i] = self.grid_ids_buffer[i]
             self.object_id[i] = self.object_id_buffer[i]

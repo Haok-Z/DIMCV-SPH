@@ -41,7 +41,14 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         self._moving_rigid_object_full_body = bool(
             cfg_get("movingRigidObjectFullBody", False)
         )
-        if self._cylinder_obstacle_enabled:
+        # A mesh body already represents the complete obstacle.  The legacy
+        # cylinder proxy clips object 2 in the x-y plane and corrupts meshes.
+        self._legacy_cylinder_proxy_object_id = 2
+        self._legacy_cylinder_proxy_applies = (
+            self._legacy_cylinder_proxy_object_id
+            not in self.ps.object_id_rigid_body
+        )
+        if self._cylinder_obstacle_enabled and self._legacy_cylinder_proxy_applies:
             self.init_cylinder()
         self._emit_stop_step = cfg_get("emitStopStep", None)
         self._emit_stop_time = cfg_get("emitStopTime", None)
@@ -54,6 +61,10 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         )
         self._cylinder_oscillation_object_id = int(
             cfg_get("cylinderOscillationObjectId", 2)
+        )
+        self._moving_rigid_object_is_mesh = (
+            self._cylinder_oscillation_object_id
+            in self.ps.object_id_rigid_body
         )
         self._cylinder_oscillation_axis = np.asarray(
             cfg_get("cylinderOscillationAxis", [1.0, 0.0]), dtype=np.float64
@@ -229,7 +240,8 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         vel3[: self.ps.dim] = vel[: self.ps.dim]
         translate = (
             self._translate_whole_object_from_rest_kernel
-            if self._moving_rigid_object_full_body
+            if (self._moving_rigid_object_full_body
+                or self._moving_rigid_object_is_mesh)
             else self._translate_object_from_rest_kernel
         )
         translate(
@@ -493,7 +505,8 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         if self._cylinder_oscillation_enabled:
             reset_translation = (
                 self._translate_whole_object_from_rest_kernel
-                if self._moving_rigid_object_full_body
+                if (self._moving_rigid_object_full_body
+                    or self._moving_rigid_object_is_mesh)
                 else self._translate_object_from_rest_kernel
             )
             reset_translation(
