@@ -13,8 +13,9 @@ Example (2D):
 import os
 import argparse
 import taichi as ti
-from config_builder import SimConfig
+from config_builder import SimConfig, resolve_output_paths
 from particle_system import ParticleSystem
+from flow_statistics import FlowStatisticsRecorder
 from pathlib import Path
 import shutil
 import time
@@ -37,18 +38,15 @@ def main():
         default="./data/scenes/DIM_von_karman_vortex_dfsph.json",
         help="Scene JSON; must use simulationMethod 1 for DFSPH-only solver",
     )
-    image_path = Path("result_images_dfsph_3D_2")
-    if image_path.exists():
-        for p in image_path.iterdir():
-            if p.is_file():
-                p.unlink()
-            elif p.is_dir():
-                shutil.rmtree(p)
-    image_path.mkdir(parents=True, exist_ok=True)
-
     args = parser.parse_args()
     scene_path = args.scene_file
     config = SimConfig(scene_file_path=scene_path)
+    image_path, ply_path = resolve_output_paths(
+        scene_path, config.config["Configuration"], "dfsph"
+    )
+    if image_path.exists():
+        shutil.rmtree(image_path)
+    image_path.mkdir(parents=True, exist_ok=True)
 
     sm = config.get_cfg("simulationMethod")
     if sm is not None and int(sm) != 1:
@@ -59,16 +57,15 @@ def main():
 
     export_ply = config.get_cfg("exportPLY")
     export_ply = bool(export_ply) if export_ply is not None else False
-    ply_path = None
     if export_ply:
-        ply_path = Path("result_ply_dfsph_3D_2")
         if ply_path.exists():
-            for p in ply_path.iterdir():
-                if p.is_file():
-                    p.unlink()
-                elif p.is_dir():
-                    shutil.rmtree(p)
+            shutil.rmtree(ply_path)
         ply_path.mkdir(parents=True, exist_ok=True)
+    else:
+        ply_path = None
+    print(f"[DFSPH] image output: {image_path}")
+    if ply_path is not None:
+        print(f"[DFSPH] PLY output: {ply_path}")
 
     simulation_time = config.get_cfg("simulationTime")
     substeps = config.get_cfg("numberOfStepsPerRenderUpdate")
@@ -77,6 +74,7 @@ def main():
     ps = ParticleSystem(config, GGUI=True)
     solver = ps.build_solver()
     solver.initialize()
+    statistics = FlowStatisticsRecorder(image_path.parent, config, "DFSPH")
 
     cnt = 0
     cnt_output = 0
@@ -85,8 +83,9 @@ def main():
         for _ in range(substeps):
             solver.step()
         cnt += 1
-        t += solver.dt[None]
+        t += solver.dt[None] * substeps
         if cnt % output_interval == 0:
+            statistics.record(solver, cnt_output, t)
             solver.export_png(cnt_output, image_path)
             if export_ply and hasattr(solver, "export_ply"):
                 solver.export_ply(cnt_output, ply_path)
@@ -96,6 +95,7 @@ def main():
             print(f"[DFSPH] Fluid_particle_num = {solver.ps.fluid_particle_num[None]}")
         if t > simulation_time or os.path.exists("stop"):
             break
+    statistics.close()
 
 
 if __name__ == "__main__":

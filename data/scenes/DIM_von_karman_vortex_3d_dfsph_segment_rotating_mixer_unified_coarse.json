@@ -14,6 +14,7 @@
     "exponent": 7,
     "boundaryHandlingMethod": 0,
     "bounceBackBoundary": false,
+    "boundaryViscosity": 0.001,
     "simulationTime": 12.0,
     "vortexEnforcingDomainStart": [0.2, 0.0, 0.0],
     "vortexEnforcingDomainEnd": [4.0, 1.0, 1.0],
@@ -25,9 +26,25 @@
     "divergenceTransitArea": [0.0, 0.02, 0.02],
     "invisibleObjects": [1],
     "cylinderObstacleEnabled": false,
+    "cylinderOscillationEnabled": false,
+    "movingRigidObjectFullBody": true,
+    "rigidRotationEnabled": true,
+    "rigidRotationObjectId": 2,
+    "rigidRotationCenter": [0.65, 0.5, 0.42],
+    "rigidRotationStartTime": 2.0,
+    "rigidRotationStopTime": 12.0,
+    "rigidRotationOnDuration": 2.0,
+    "rigidRotationOffDuration": 2.0,
+    "rigidAngularVelocityDegPerSecond": 650.0,
+    "imageVorticityAutoScale": false,
+    "imageVorticityVmin": -40,
+    "imageVorticityVmax": 40,
+    "imageFluidPointSize": 0.2,
+    "imageFluidAlpha": 0.6,
+    "vorticityLossUsePredictedOmega": true,
     "statisticsEnabled": true,
-    "statisticsVorticityThreshold": 10.0,
     "statisticsVorticityField": "raw",
+    "statisticsVorticityThreshold": 10.0,
     "exportPLY": true,
     "exportPLYAxisConvention": "y_up"
   },
@@ -76,7 +93,7 @@
     "sphBoundaryVortexResidualSupportRadiusScale": 1.0,
     "sphBoundaryVorticityInjectionRegion": "box",
     "sphBoundaryVorticityInjectionDomainStart": [0.0, 0.02, 0.05],
-    "sphBoundaryVorticityInjectionDomainEnd": [4.0, 0.98, 0.35],
+    "sphBoundaryVorticityInjectionDomainEnd": [4.0, 0.98, 0.4333333333333333],
     "sphBoundaryVorticityInjectionOrientation": "omega",
     "sphBoundaryVorticityInjectionGammaMode": "omega_dot_t",
     "sphBoundaryVorticityInjectionDistance": 0.035,
@@ -90,9 +107,9 @@
     "sphSegmentBsCoupling": 0.6,
     "sphSegmentBsFeedbackSkipBoundary": true,
     "sphToSegmentDepositEnabled": false,
-    "imageExportSubfolderSph": "sph_sphere_hybrid",
-    "imageExportSubfolderSegments": "segments_sphere_hybrid",
-    "imageExportSubfolderGhost": "ghost_sphere_hybrid",
+    "imageExportSubfolderSph": "sph_rotating_mixer_unified_hybrid",
+    "imageExportSubfolderSegments": "segments_rotating_mixer_unified_hybrid",
+    "imageExportSubfolderGhost": "ghost_rotating_mixer_unified_hybrid",
     "imageVorticityAutoScale": false,
     "imageVorticityVmin": -40,
     "imageVorticityVmax": 40,
@@ -107,29 +124,32 @@
     "exportSegmentPLY": true,
     "exportPLYAxisConvention": "y_up"
   },
-  "FluidEmitters": [
+  "FluidBlocks": [
     {
-      "objectId": 0,
-      "squareCenter": [0.0, 0.5, 0.2],
-      "squareSize": [0.0, 0.94, 0.3],
-      "velocity": [2.0, 0.0, 0.0],
+      "objectId": 3,
+      "start": [1.05, 0.06, 0.06],
+      "end": [3.94, 0.94, 0.4333333333333333],
+      "translation": [0.0, 0.0, 0.0],
+      "scale": [1, 1, 1],
+      "velocity": [0.0, 0.0, 0.0],
       "density": 1000.0,
       "color": [50, 100, 200]
     }
   ],
+  "FluidEmitters": [],
   "RigidBlocks": [
-    {"objectId": 1, "start": [0.0, 0.0, 0.0], "end": [4.0, 0.02, 1.0], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false},
-    {"objectId": 1, "start": [0.0, 0.0, 0.0], "end": [4.0, 0.02, 1.0], "translation": [0.0, 0.98, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false},
-    {"objectId": 1, "start": [3.98, 0.02, 0.02], "end": [4.0, 0.25, 1.0], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false},
-    {"objectId": 1, "start": [3.98, 0.75, 0.02], "end": [4.0, 0.98, 1.0], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false},
-    {"objectId": 1, "start": [0.0, 0.0, 0.0], "end": [4.0, 1.0, 0.03], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false}
+    {"objectId": 1, "start": [0.0, 0.0, 0.0], "end": [4.0, 1.0, 0.04], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false},
+    {"objectId": 1, "start": [0.0, 0.0, 0.04], "end": [4.0, 0.04, 1.0], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false},
+    {"objectId": 1, "start": [0.0, 0.96, 0.04], "end": [4.0, 1.0, 1.0], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false},
+    {"objectId": 1, "start": [0.0, 0.04, 0.04], "end": [0.04, 0.96, 1.0], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false},
+    {"objectId": 1, "start": [3.96, 0.04, 0.04], "end": [4.0, 0.96, 1.0], "translation": [0.0, 0.0, 0.0], "scale": [1, 1, 1], "velocity": [0.0, 0.0, 0.0], "density": 1000.0, "color": [201, 112, 100], "isDynamic": false}
   ],
   "RigidBodies": [
     {
       "objectId": 2,
-      "geometryFile": "./data/Meshes/Sphere.ply",
-      "scale": [0.36, 0.36, 0.36],
-      "translation": [0.65, 0.5, 0.0],
+      "geometryFile": "./data/Meshes/Mixer.ply",
+      "scale": [0.43, 0.43, 0.43],
+      "translation": [0.65, 0.5, -0.08],
       "rotationAngle": 0.0,
       "rotationAxis": [0.0, 0.0, 1.0],
       "velocity": [0.0, 0.0, 0.0],
@@ -137,5 +157,6 @@
       "color": [201, 112, 100],
       "isDynamic": false
     }
-  ]
+  ],
+  "Cylinders": []
 }

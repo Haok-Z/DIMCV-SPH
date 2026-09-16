@@ -99,6 +99,22 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             )
         self._cylinder_linear_velocity = self._cylinder_linear_velocity[: self.ps.dim]
 
+        # Repeating one-way translation for a plate/piston experiment.  The
+        # object advances to a target, pauses there, then returns more slowly
+        # to its rest position and starts the next advance.
+        self._cylinder_pingpong_forward_distance = float(
+            cfg_get("cylinderPingPongForwardDistance", self._cylinder_oscillation_amplitude)
+        )
+        self._cylinder_pingpong_forward_duration = max(
+            1e-12, float(cfg_get("cylinderPingPongForwardDuration", 1.0))
+        )
+        self._cylinder_pingpong_return_duration = max(
+            1e-12, float(cfg_get("cylinderPingPongReturnDuration", 2.0))
+        )
+        self._cylinder_pingpong_target_pause = max(
+            0.0, float(cfg_get("cylinderPingPongTargetPause", 0.0))
+        )
+
         # When true (linear mode only), clamp the cylinder translation so its
         # center stops at the position symmetric to circle_pos about the domain
         # center:  stop = domain_start + domain_end - circle_pos.
@@ -108,6 +124,68 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         # Current applied offset (after clamping); other subsystems (e.g. the
         # segment hybrid solver) read this to sync obstacle geometry.
         self._cylinder_current_offset = np.zeros(self.ps.dim, dtype=np.float64)
+
+        # Prescribed rotation for a complete rigid object. Angles follow the
+        # right-hand rule; therefore a negative Z angular velocity is clockwise
+        # when viewed from +Z toward the origin.
+        self._rigid_rotation_enabled = bool(
+            cfg_get("rigidRotationEnabled", False)
+        )
+        self._rigid_rotation_object_id = int(
+            cfg_get("rigidRotationObjectId", 2)
+        )
+        rotation_center = np.asarray(
+            cfg_get("rigidRotationCenter", [0.0, 0.0, 0.0]),
+            dtype=np.float64,
+        ).reshape(-1)
+        if rotation_center.size < 3:
+            rotation_center = np.pad(
+                rotation_center,
+                (0, 3 - rotation_center.size),
+                constant_values=0.0,
+            )
+        self._rigid_rotation_center = rotation_center[:3]
+        self._rigid_rotation_start_time = float(
+            cfg_get("rigidRotationStartTime", 0.0)
+        )
+        self._rigid_rotation_stop_time = float(
+            cfg_get("rigidRotationStopTime", np.inf)
+        )
+        if self._rigid_rotation_stop_time < self._rigid_rotation_start_time:
+            raise ValueError(
+                "rigidRotationStopTime must be greater than or equal to "
+                "rigidRotationStartTime"
+            )
+        # Optional periodic on/off schedule. When both durations are positive,
+        # rotation starts at rigidRotationStartTime, stays on for
+        # rigidRotationOnDuration, stays off for rigidRotationOffDuration, and
+        # repeats until rigidRotationStopTime (or the end of the experiment).
+        self._rigid_rotation_on_duration = float(
+            cfg_get("rigidRotationOnDuration", 0.0)
+        )
+        self._rigid_rotation_off_duration = float(
+            cfg_get("rigidRotationOffDuration", 0.0)
+        )
+        if self._rigid_rotation_on_duration < 0.0:
+            raise ValueError("rigidRotationOnDuration must be non-negative")
+        if self._rigid_rotation_off_duration < 0.0:
+            raise ValueError("rigidRotationOffDuration must be non-negative")
+        if (
+            (self._rigid_rotation_on_duration > 0.0)
+            != (self._rigid_rotation_off_duration > 0.0)
+        ):
+            raise ValueError(
+                "rigidRotationOnDuration and rigidRotationOffDuration must "
+                "both be positive or both be zero"
+            )
+        self._rigid_rotation_periodic = (
+            self._rigid_rotation_on_duration > 0.0
+            and self._rigid_rotation_off_duration > 0.0
+        )
+        self._rigid_angular_velocity = np.deg2rad(float(
+            cfg_get("rigidAngularVelocityDegPerSecond", 0.0)
+        ))
+        self._rigid_current_angle = 0.0
 
     @ti.kernel
     def init_circle(self):
@@ -186,6 +264,33 @@ class KarmanVortexSolver(DIMCVSPHSolver):
                     self.ps.x[p] = self.ps.x_0[p] + ti.Vector([off0, off1, off2])
                     self.ps.v[p] = ti.Vector([vel0, vel1, vel2])
 
+    @ti.kernel
+    def _rotate_whole_object_about_z_from_rest_kernel(
+        self,
+        object_id: ti.i32,
+        center_x: float,
+        center_y: float,
+        angle: float,
+        angular_velocity: float,
+    ):
+        """Rebuild a complete rigid object's Z rotation from rest positions."""
+        cos_angle = ti.cos(angle)
+        sin_angle = ti.sin(angle)
+        for p in range(self.ps.particle_num[None]):
+            if self.ps.object_id[p] == object_id:
+                self.ps.is_active[p] = 1
+                rel_x = self.ps.x_0[p][0] - center_x
+                rel_y = self.ps.x_0[p][1] - center_y
+                rotated_x = cos_angle * rel_x - sin_angle * rel_y
+                rotated_y = sin_angle * rel_x + cos_angle * rel_y
+                self.ps.x[p][0] = center_x + rotated_x
+                self.ps.x[p][1] = center_y + rotated_y
+                self.ps.v[p][0] = -angular_velocity * rotated_y
+                self.ps.v[p][1] = angular_velocity * rotated_x
+                if ti.static(self.ps.dim == 3):
+                    self.ps.x[p][2] = self.ps.x_0[p][2]
+                    self.ps.v[p][2] = 0.0
+
     def _should_emit_this_step(self) -> bool:
         if self._emit_stop_step is not None and int(self.cnt) >= int(self._emit_stop_step):
             return False
@@ -207,7 +312,31 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             self._cylinder_current_offset[: self.ps.dim] = 0.0
             return
         tau = t - self._cylinder_oscillation_start_time
-        if self._cylinder_motion_mode in ("linear", "translate", "translation"):
+        if self._cylinder_motion_mode in ("pingpong", "piston", "reciprocating", "repeat_linear"):
+            # Periodic push toward the configured target, dwell, slow return,
+            # dwell at rest, and repeat.  The offset is rebuilt from x_0 so
+            # there is no accumulated drift across cycles.
+            forward = self._cylinder_pingpong_forward_duration
+            target_pause = self._cylinder_pingpong_target_pause
+            backward = self._cylinder_pingpong_return_duration
+            rest_pause = self._cylinder_pingpong_target_pause
+            cycle = forward + target_pause + backward + rest_pause
+            phase = tau % cycle
+            distance = self._cylinder_pingpong_forward_distance
+            offset = np.zeros(self.ps.dim, dtype=np.float64)
+            vel = np.zeros(self.ps.dim, dtype=np.float64)
+            if phase < forward:
+                progress = phase / forward
+                offset[0] = distance * progress
+                vel[0] = distance / forward
+            elif phase < forward + target_pause:
+                offset[0] = distance
+            elif phase < forward + target_pause + backward:
+                progress = (phase - forward - target_pause) / backward
+                offset[0] = distance * (1.0 - progress)
+                vel[0] = -distance / backward
+            # The remaining rest_pause leaves the plate at its initial pose.
+        elif self._cylinder_motion_mode in ("linear", "translate", "translation"):
             offset = tau * self._cylinder_linear_velocity
             vel = self._cylinder_linear_velocity.copy()
             if self._cylinder_linear_stop_at_symmetric:
@@ -248,6 +377,51 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             self._cylinder_oscillation_object_id,
             float(off3[0]), float(off3[1]), float(off3[2]),
             float(vel3[0]), float(vel3[1]), float(vel3[2]),
+        )
+
+    def _update_rotating_rigid_object(self):
+        if not self._rigid_rotation_enabled:
+            return
+        t = float(self.cnt) * float(self.dt[None])
+        elapsed = t - self._rigid_rotation_start_time
+        if self._rigid_rotation_periodic:
+            cycle_duration = (
+                self._rigid_rotation_on_duration
+                + self._rigid_rotation_off_duration
+            )
+            if elapsed <= 0.0 or t >= self._rigid_rotation_stop_time:
+                active_duration = 0.0
+                angular_velocity = 0.0
+            else:
+                cycle_elapsed = elapsed % cycle_duration
+                completed_cycles = np.floor(elapsed / cycle_duration)
+                active_duration = (
+                    completed_cycles * self._rigid_rotation_on_duration
+                    + min(cycle_elapsed, self._rigid_rotation_on_duration)
+                )
+                angular_velocity = (
+                    self._rigid_angular_velocity
+                    if cycle_elapsed < self._rigid_rotation_on_duration
+                    else 0.0
+                )
+        else:
+            active_duration = min(
+                max(elapsed, 0.0),
+                self._rigid_rotation_stop_time - self._rigid_rotation_start_time,
+            )
+            angular_velocity = (
+                self._rigid_angular_velocity
+                if self._rigid_rotation_start_time <= t < self._rigid_rotation_stop_time
+                else 0.0
+            )
+        angle = self._rigid_angular_velocity * active_duration
+        self._rigid_current_angle = angle
+        self._rotate_whole_object_about_z_from_rest_kernel(
+            self._rigid_rotation_object_id,
+            float(self._rigid_rotation_center[0]),
+            float(self._rigid_rotation_center[1]),
+            float(angle),
+            float(angular_velocity),
         )
 
     def export_png(self, cnt, image_path):
@@ -520,6 +694,7 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             self.dump_num_particles_each_emitters_np2ti()
             self.ps.rebuild_neighbor_grid()
         self._update_oscillating_cylinder()
+        self._update_rotating_rigid_object()
         self.cnt += 1
         self.compute_moving_boundary_volume()
         if int(self.ps.fluid_particle_num[None]) <= 0:

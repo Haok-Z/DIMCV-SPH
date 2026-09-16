@@ -259,6 +259,12 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         )
         self._img_vort_vmin = float(self.seg_cfg.get_cfg("imageVorticityVmin", -40.0))
         self._img_vort_vmax = float(self.seg_cfg.get_cfg("imageVorticityVmax", 40.0))
+        self._img_fluid_point_size = float(
+            self.ps.cfg.get_cfg("imageFluidPointSize", 0.2)
+        )
+        self._img_fluid_alpha = float(
+            self.ps.cfg.get_cfg("imageFluidAlpha", 0.6)
+        )
         self._export_segment_panel = bool(
             self.seg_cfg.get_cfg("imageExportSegmentPanel", True)
         )
@@ -3375,10 +3381,10 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             fluid_x[:, 2],
             c=fluid_vort,
             cmap=self._segment_cmap,
-            s=0.2,
+            s=self._img_fluid_point_size,
             norm=vnorm,
             edgecolors="none",
-            alpha=0.6,
+            alpha=self._img_fluid_alpha,
         )
         ax.scatter(
             solid_x[:, 0],
@@ -3486,8 +3492,12 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
 
         _pt = self.ps.cfg.get_cfg("imageFluidPointSize")
         _al = self.ps.cfg.get_cfg("imageFluidAlpha")
-        pt_size = float(_pt if _pt is not None else 2.5)
-        pt_alpha = float(_al if _al is not None else 1.0)
+        pt_size = float(
+            _pt if _pt is not None else self._img_fluid_point_size
+        )
+        pt_alpha = float(
+            _al if _al is not None else self._img_fluid_alpha
+        )
 
         fig, ax = plt.subplots(figsize=(10, 2.5), dpi=200)
         ax.scatter(

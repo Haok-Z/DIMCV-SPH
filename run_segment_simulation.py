@@ -7,6 +7,7 @@ from pathlib import Path
 import taichi as ti
 
 from segment_config import SegmentConfig
+from config_builder import resolve_output_paths
 from segment_system import SegmentSystem
 from segment_solver import SegmentSolver
 from segment_export import SegmentExporter
@@ -45,12 +46,16 @@ def main():
     export_ply = bool(cfg.get_cfg("exportPLY", True))
     export_images = bool(cfg.get_cfg("exportImages", True))
 
-    out_ply = Path("result_segment_ply_Karman2D_07")
-    out_img = Path("result_segment_images_Karman2D_07")
+    out_img, out_ply = resolve_output_paths(
+        args.scene_file, cfg.config.get("SegmentConfiguration", {}), "segment"
+    )
     if export_ply:
         clear_dir(out_ply)
     if export_images:
         clear_dir(out_img)
+    print(f"[Segment] image output: {out_img}", flush=True)
+    if export_ply:
+        print(f"[Segment] PLY output: {out_ply}", flush=True)
 
     ss = SegmentSystem(cfg)
     print("[Segment] SegmentSystem created", flush=True)

@@ -1,0 +1,436 @@
+{
+  "Configuration": {
+    "domainStart": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "domainEnd": [
+      3.0,
+      1.0,
+      1.0
+    ],
+    "deleteFluidParticlesOutsideDomain": true,
+    "domainCullMargin": 0.0,
+    "particleRadius": 0.01,
+    "numberOfStepsPerRenderUpdate": 1,
+    "density0": 1000,
+    "simulationMethod": 2,
+    "gravitation": [
+      0.0,
+      0.0,
+      -9.8
+    ],
+    "timeStepSize": 0.002,
+    "stiffness": 50000,
+    "exponent": 7,
+    "boundaryHandlingMethod": 0,
+    "bounceBackBoundary": false,
+    "simulationTime": 6.0,
+    "vortexEnforcingDomainStart": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "vortexEnforcingDomainEnd": [
+      3.0,
+      1.0,
+      1.0
+    ],
+    "volumeScale": 0.2,
+    "GenProbPara": 5,
+    "DelProbPara": 3.5,
+    "reservedCapacity": 1500000,
+    "windowRes": [
+      1536,
+      512,
+      512
+    ],
+    "divergenceTransitArea": [
+      0.0,
+      0.02,
+      0.02
+    ],
+    "invisibleObjects": [
+      1
+    ],
+    "exportPLY": true,
+    "exportPLYAxisConvention": "z_up",
+    "emitStopStep": 0,
+    "cylinderObstacleEnabled": false,
+    "cylinderOscillationEnabled": false,
+    "movingRigidObjectFullBody": true,
+    "rigidRotationEnabled": true,
+    "rigidRotationObjectId": 2,
+    "rigidRotationCenter": [
+      0.4,
+      0.5,
+      0.15
+    ],
+    "rigidRotationStartTime": 1.0,
+    "rigidRotationStopTime": 4.0,
+    "rigidAngularVelocityDegPerSecond": -600.0,
+    "imageVorticityAutoScale": false,
+    "imageVorticityVmin": -40,
+    "imageVorticityVmax": 40,
+    "imageFluidPointSize": 1.0,
+    "imageFluidAlpha": 1.0,
+    "vorticityLossUsePredictedOmega": true,
+    "statisticsEnabled": true,
+    "statisticsVorticityField": "raw",
+    "statisticsVorticityThreshold": 10.0
+  },
+  "FluidBlocks": [
+    {
+      "objectId": 3,
+      "start": [
+        0.68,
+        0.045,
+        0.045
+      ],
+      "end": [
+        2.955,
+        0.955,
+        0.315
+      ],
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "density": 1000.0,
+      "color": [
+        50,
+        100,
+        200
+      ]
+    }
+  ],
+  "FluidEmitters": [],
+  "RigidBlocks": [
+    {
+      "objectId": 1,
+      "start": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "end": [
+        3.0,
+        1.0,
+        0.02
+      ],
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "density": 1000.0,
+      "color": [
+        201,
+        112,
+        100
+      ],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "end": [
+        3.0,
+        0.02,
+        1.0
+      ],
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "density": 1000.0,
+      "color": [
+        201,
+        112,
+        100
+      ],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [
+        0.0,
+        0.98,
+        0.0
+      ],
+      "end": [
+        3.0,
+        1.0,
+        1.0
+      ],
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "density": 1000.0,
+      "color": [
+        201,
+        112,
+        100
+      ],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [
+        0.0,
+        0.02,
+        0.0
+      ],
+      "end": [
+        0.02,
+        0.98,
+        1.0
+      ],
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "density": 1000.0,
+      "color": [
+        201,
+        112,
+        100
+      ],
+      "isDynamic": false
+    },
+    {
+      "objectId": 1,
+      "start": [
+        2.98,
+        0.02,
+        0.0
+      ],
+      "end": [
+        3.0,
+        0.98,
+        1.0
+      ],
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "density": 1000.0,
+      "color": [
+        201,
+        112,
+        100
+      ],
+      "isDynamic": false
+    }
+  ],
+  "RigidBodies": [
+    {
+      "objectId": 2,
+      "geometryFile": "./data/Meshes/propeller_triangulated.ply",
+      "scale": [
+        0.14,
+        0.14,
+        0.14
+      ],
+      "translation": [
+        0.4,
+        0.5,
+        0.1498610785
+      ],
+      "rotationAngle": 90.0,
+      "rotationAxis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "density": 1000.0,
+      "color": [
+        240,
+        145,
+        60
+      ],
+      "isDynamic": false
+    }
+  ],
+  "Cylinders": [],
+  "SegmentConfiguration": {
+    "domainStart": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "domainEnd": [
+      3.0,
+      1.0,
+      1.0
+    ],
+    "timeStepSize": 0.002,
+    "simulationTime": 6.0,
+    "segmentMaxNum": 180000,
+    "biotSavartModel": "finite_segment",
+    "pointVortexLifetimeMode": "persistent",
+    "sphSegmentFeedbackMode": "bs_direct",
+    "regularizationRadiusR": 0.006,
+    "backgroundVelocity": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "segmentAdvectionBackgroundVelocity": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "gammaDecay": 0.98,
+    "splitLengthThreshold": 0.12,
+    "enableSplitSegments": true,
+    "enableMergeSegments": false,
+    "enableDeleteWeakSegments": true,
+    "enableGpuDeleteCompact": true,
+    "deleteGammaThreshold": 1e-06,
+    "deleteOutsideDomain": true,
+    "enableBoundaryInjection": false,
+    "segmentAdvectionMode": "sph_velocity",
+    "segmentAdvectionUseBiotSavart": false,
+    "segmentAdvectionUseSphVelocity": true,
+    "segmentAdvectionUseBackground": false,
+    "sphVelocityToSegmentAdvectionEnabled": true,
+    "sphVelocityToSegmentAdvectionBlend": 1.0,
+    "sphVelocityToSegmentAdvectionScale": 1.0,
+    "sphVelocityToSegmentAdvectionSkipBoundary": true,
+    "deleteInteriorSegmentsInsideObstacles": true,
+    "deleteInsideObstacleMargin": 0.0045,
+    "deleteInsideObstacleSegmentTypeIds": [
+      0
+    ],
+    "deleteInsideObstacleIncludeRigidBlocks": true,
+    "deleteInsideObstacleRigidBlockExcludeObjectIds": [
+      2
+    ],
+    "deleteInsideObstacleIncludeCylinders": false,
+    "sphBoundaryVorticityInjectionEnabled": true,
+    "sphBoundaryVorticityInjectionIntervalSteps": 4,
+    "sphBoundaryVorticityInjectionStartStep": 500,
+    "sphBoundaryVorticityInjectionThreshold": 10.0,
+    "sphBoundaryVorticityInjectionSource": "vorticity",
+    "sphBoundaryVorticityInjectionThresholdSource": "vorticity",
+    "sphBoundaryVorticityInjectionUseResidualVorticity": true,
+    "sphBoundaryVortexResidualSupportRadiusScale": 1.0,
+    "sphBoundaryVorticityInjectionRegion": "box",
+    "sphBoundaryVorticityInjectionDomainStart": [
+      0.02,
+      0.02,
+      0.035
+    ],
+    "sphBoundaryVorticityInjectionDomainEnd": [
+      2.98,
+      0.98,
+      0.36
+    ],
+    "sphBoundaryVorticityInjectionOrientation": "omega",
+    "sphBoundaryVorticityInjectionGammaMode": "omega_dot_t",
+    "sphBoundaryVorticityInjectionDistance": 0.035,
+    "sphBoundaryVorticityInjectionMaxPerStep": 400,
+    "sphBoundaryVorticityInjectionSelection": "top_strength",
+    "sphBoundaryVorticityInjectionSegmentLength": 0.018,
+    "sphBoundaryVorticityInjectionGammaScale": 1.0,
+    "sphBoundaryVorticityInjectionSegmentTypeId": 0,
+    "initType": "none",
+    "outflowDeleteCenterBeyondX": 3.0,
+    "sphSegmentBsCoupling": 0.6,
+    "sphSegmentBsFeedbackSkipBoundary": true,
+    "sphToSegmentDepositEnabled": false,
+    "imageExportSubfolderSph": "sph_propeller_hybrid",
+    "imageExportSubfolderSegments": "segments_propeller_hybrid",
+    "imageExportSubfolderGhost": "ghost_propeller_hybrid",
+    "imageVorticityAutoScale": false,
+    "imageVorticityVmin": -40,
+    "imageVorticityVmax": 40,
+    "imageSegmentColormap": "coolwarm",
+    "imageSegmentGammaAutoScale": false,
+    "imageSegmentGammaVmin": -0.0002,
+    "imageSegmentGammaVmax": 0.0002,
+    "imageSegmentLineWidth": 0.35,
+    "imageShowBoundarySegments": true,
+    "imageSegmentPanelIncludeSolid": true,
+    "imageShowSolids": true,
+    "exportSegmentPLY": true,
+    "exportPLYAxisConvention": "z_up"
+  }
+}
