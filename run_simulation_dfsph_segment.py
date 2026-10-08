@@ -63,6 +63,7 @@ def main():
         ply_path.mkdir(parents=True, exist_ok=True)
     else:
         ply_path = None
+    export_timing = bool(config.get_cfg("debugExportTiming", False))
     print(f"[DFSPH+Segment] image output: {image_path}")
     if ply_path is not None:
         print(f"[DFSPH+Segment] PLY output: {ply_path}")
@@ -85,10 +86,20 @@ def main():
         cnt += 1
         t += solver.dt[None] * substeps
         if cnt % output_interval == 0:
+            export_t0 = time.perf_counter() if export_timing else 0.0
             statistics.record(solver, cnt_output, t)
             solver.export_png(cnt_output, image_path)
             if export_ply and hasattr(solver, "export_ply"):
                 solver.export_ply(cnt_output, ply_path)
+            if export_timing:
+                elapsed_ms = (time.perf_counter() - export_t0) * 1000.0
+                n_particles = int(solver.ps.particle_num[None])
+                n_segments = int(solver.ss_seg.segment_num[None]) if hasattr(solver, "ss_seg") else 0
+                print(
+                    f"[export-timing] frame={cnt_output} elapsed={elapsed_ms:.3f}ms "
+                    f"particles={n_particles} segments={n_segments} "
+                    f"ply={bool(export_ply)}"
+                )
             cnt_output += 1
         if cnt % 50 == 0:
             print(f"[DFSPH+Seg] Simulation Time = {t:.2f}s")

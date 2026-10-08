@@ -1,0 +1,44 @@
+{
+  "sampleInterval": 0.25,
+  "cases": {
+    "sphere_coarse": {
+      "scenes": {
+        "dimcv": "data/scenes/DIM_von_karman_vortex_3d_dimcv_sphere_coarse.json",
+        "dfsph": "data/scenes/DIM_von_karman_vortex_3d_dfsph_sphere_coarse.json",
+        "dfsph_segment": "data/scenes/DIM_von_karman_vortex_3d_dfsph_segment_sphere_coarse.json"
+      },
+      "maxTimeError": 0.02,
+      "gridSpacings": [0.025, 0.0125],
+      "regions": {
+        "wake_roi": {"start": [0.8, 0.05, 0.04], "end": [3.6, 0.95, 0.45]}
+      },
+      "stages": {"developed_wake": [[4.0, 12.0]]}
+    },
+    "propeller_coarse": {
+      "scenes": {
+        "dimcv": "data/scenes/DIM_von_karman_vortex_3d_dimcv_propeller_tank_fluid_block.json",
+        "dfsph": "data/scenes/DIM_von_karman_vortex_3d_dfsph_propeller_tank_fluid_block.json",
+        "dfsph_segment": "data/scenes/DIM_von_karman_vortex_3d_dfsph_segment_propeller_tank_fluid_block.json"
+      },
+      "maxTimeError": 0.02,
+      "gridSpacings": [0.025, 0.0125],
+      "regions": {
+        "wake_roi": {"start": [0.55, 0.1, 0.04], "end": [2.5, 0.9, 0.38]}
+      },
+      "stages": {"driven": [[1.0, 4.0]], "decay": [[4.0, 6.0]]}
+    },
+    "mixer_coarse": {
+      "scenes": {
+        "dimcv": "data/scenes/DIM_von_karman_vortex_3d_dimcv_rotating_mixer_unified_coarse.json",
+        "dfsph": "data/scenes/DIM_von_karman_vortex_3d_dfsph_rotating_mixer_unified_coarse.json",
+        "dfsph_segment": "data/scenes/DIM_von_karman_vortex_3d_dfsph_segment_rotating_mixer_unified_coarse.json"
+      },
+      "maxTimeError": 0.02,
+      "gridSpacings": [0.025, 0.0125],
+      "regions": {
+        "mixing_roi": {"start": [0.95, 0.1, 0.04], "end": [3.0, 0.9, 0.5]}
+      },
+      "stages": {"driven": [[2.0, 4.0], [6.0, 8.0], [10.0, 12.0]], "coast": [[4.0, 6.0], [8.0, 10.0]]}
+    }
+  }
+}

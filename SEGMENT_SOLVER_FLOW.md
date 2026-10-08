@@ -155,9 +155,11 @@ def step():
 - `backgroundVelocity`：背景流
 - `splitLengthThreshold`：分裂阈值
 - `mergeDistanceLambda`：合并距离阈值
-- `mergeAngleThreshold`：合并方向阈值
+- `mergeAngleThreshold`：偏离反向环量方向的容差；合并要求 `Gamma*d` 近似反向
+- `mergeIntervalSteps`：合并间隔；设为 `1` 表示每步在分裂后立即合并
 - `deleteGammaThreshold`：删除阈值
 - `gammaDecay`：每步衰减
+- `residualSegmentGammaBlend`：持久 residual 对已有段的可选 SPH 纠偏强度；`0` 表示环量守恒模式，正值表示显式纠偏模式
 - `enableBoundaryInjection`：是否开启边界注涡
 - `exportInterval`：导出间隔
 - `exportPLY`：是否导出

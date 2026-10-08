@@ -40,6 +40,20 @@ def _segment_cfg_use_2d_point_vortex_bs(cfg, spatial_dim: int) -> bool:
 class SegmentSolver:
     def __init__(self, segment_system):
         self.ss = segment_system
+        convention = str(
+            self.ss.cfg.get_cfg("segmentStrengthConvention", "paper_circulation")
+            or "paper_circulation"
+        ).lower().strip()
+        if convention not in (
+            "paper_circulation",
+            "legacy_mixed",
+            "residual_circulation",
+        ):
+            raise ValueError(
+                "segmentStrengthConvention must be 'paper_circulation', "
+                "'legacy_mixed', or 'residual_circulation'"
+            )
+        self.segment_strength_convention = convention
         self.dt = float(self.ss.cfg.get_cfg("timeStepSize", 0.002))
         self.reg_radius = float(self.ss.cfg.get_cfg("regularizationRadiusR", 0.01))
         self.gamma_decay = float(self.ss.cfg.get_cfg("gammaDecay", 1.0))
@@ -123,6 +137,8 @@ class SegmentSolver:
         self._bs_2d_point = _segment_cfg_use_2d_point_vortex_bs(
             self.ss.cfg, self.ss.dim
         )
+        self._use_paper_circulation = ti.field(dtype=ti.i32, shape=())
+        self._use_paper_circulation[None] = 0 if convention == "legacy_mixed" else 1
         self._bs_2d_normal_sign = ti.field(dtype=float, shape=())
         _normal_dir = str(
             self.ss.cfg.get_cfg("pointVortex2DNormalDirection", "out") or "out"
@@ -134,6 +150,7 @@ class SegmentSolver:
             self._bs_2d_normal_sign[None] = -1.0
         else:
             self._bs_2d_normal_sign[None] = 1.0
+
         sch = str(self.ss.cfg.get_cfg("boundaryInjectionSchedule", "each_step") or "each_step").lower().strip()
         if sch in ("init", "initialize", "initialize_only", "once", "static", "static_once"):
             self._boundary_schedule = "initialize_only"
@@ -1294,7 +1311,7 @@ class SegmentSolver:
                 xmj = self.ss.x_minus[j]
                 xpj = self.ss.x_plus[j]
                 cj = 0.5 * (xmj + xpj)
-                dj = xpj - xmj
+                dj = self.ss.delta[j]
                 Lj = dj.norm() + 1e-8
                 tj = dj / Lj
                 omega = self.ss.gamma[j] * Lj * tj  # (3,)
@@ -1360,7 +1377,9 @@ class SegmentSolver:
 
         三维流用式 (6)；二维请用 biotSavartModel: point_vortex_2d（式 (7)）。
 
-        数据约定：段上涡向量取 gamma*(x^+−x^−)，则 Γ_j = gamma_j * L_j。
+        paper_circulation 下段上涡量积分向量为 gamma_j*(x^+−x^−)，
+        且有限段公式直接使用 Gamma_j=gamma_j；legacy_mixed 保留旧的
+        Gamma_j=gamma_j*L_j 解释。
         """
         inv4pi = 1.0 / (4.0 * ti.math.pi)
         R2 = reg_radius * reg_radius
@@ -1387,7 +1406,7 @@ class SegmentSolver:
 
                 am = self.ss.x_minus[j]
                 ap = self.ss.x_plus[j]
-                d = ap - am
+                d = self.ss.delta[j]
                 Lj = d.norm() + 1e-8
                 gamma_j = self.ss.gamma[j]
                 Gamma = gamma_j * Lj
@@ -1510,7 +1529,7 @@ class SegmentSolver:
                     continue
                 am = self.ss.x_minus[j]
                 ap = self.ss.x_plus[j]
-                d = ap - am
+                d = self.ss.delta[j]
                 Lj = d.norm() + 1e-8
                 Gamma = self.ss.gamma[j] * Lj
 
@@ -1578,6 +1597,30 @@ class SegmentSolver:
         self._update_endpoints_rk4()
         if self._advect_fix_segment_length:
             self._project_endpoints_fixed_ref_geometry()
+
+    @ti.kernel
+    def advect_segments_sph_only(self):
+        """Exact fast path when the velocity field is the cached SPH endpoint field.
+
+        In this mode all RK4 stages evaluate the same cached endpoint velocity,
+        so RK4 collapses to one Euler update without changing the result.
+        """
+        n = self.ss.segment_num[None]
+        for i in range(n):
+            if self.ss.active[i] != 1 or self._advect_frozen(self.ss.seg_type[i]) == 1:
+                continue
+            # Keep the public endpoint-velocity fields consistent with the
+            # velocity actually used by this fast path.  Topology/deletion
+            # stages (notably slow-point-vortex culling) inspect v_minus /
+            # v_plus after advection.  Leaving them stale at zero makes every
+            # SPH-only segment look stationary and deletes newly injected
+            # residual-circulation segments immediately.
+            self.v_minus[i] = self.sph_advect_velocity_minus[i]
+            self.v_plus[i] = self.sph_advect_velocity_plus[i]
+            self.ss.x_minus[i] += self.dt * self.v_minus[i]
+            self.ss.x_plus[i] += self.dt * self.v_plus[i]
+            self.ss.gamma[i] *= self.gamma_decay
+            self.ss.age[i] += self.dt
 
     @ti.kernel
     def _advect_segments_euler_placeholder(self):
@@ -1706,7 +1749,7 @@ class SegmentSolver:
 
                 xmj = self.ss.x_minus[j]
                 xpj = self.ss.x_plus[j]
-                dj = xpj - xmj
+                dj = self.ss.delta[j]
                 omega = self.ss.gamma[j] * dj
 
                 r_m = xmi - (0.5 * (xmj + xpj))
@@ -1759,7 +1802,7 @@ class SegmentSolver:
 
                 am = self.ss.x_minus[j]
                 ap = self.ss.x_plus[j]
-                d = ap - am
+                d = self.ss.delta[j]
                 Lj = d.norm() + 1e-8
                 Gamma = self.ss.gamma[j] * Lj
 
@@ -2101,12 +2144,16 @@ class SegmentSolver:
             xp_old = self.ss.x_plus[i]
             mid = 0.5 * (xm + xp_old)
 
-            # 更新原段为 [xm, mid]
-            self.ss.x_plus[i] = mid
-
-            # 追加新段 [mid, xp_old]
+            # Reserve capacity before changing the parent.  If the pool is
+            # full, leave the original segment untouched.
             new_idx = ti.atomic_add(self.ss.segment_num[None], 1)
             if new_idx < max_n:
+                # 更新原段为 [xm, mid]
+                self.ss.x_plus[i] = mid
+                parent_volume = self.point_vortex_volume[i]
+                self.point_vortex_volume[i] = 0.5 * parent_volume
+
+                # 追加新段 [mid, xp_old]
                 self.ss.x_minus[new_idx] = mid
                 self.ss.x_plus[new_idx] = xp_old
                 self.ss.gamma[new_idx] = self.ss.gamma[i]
@@ -2116,10 +2163,11 @@ class SegmentSolver:
                 self.sph_advect_velocity_minus[new_idx] = self.sph_advect_velocity_minus[i]
                 self.sph_advect_velocity_plus[new_idx] = self.sph_advect_velocity_plus[i]
                 self.initial_sph_advect_remaining[new_idx] = self.initial_sph_advect_remaining[i]
-                self.point_vortex_volume[new_idx] = self.point_vortex_volume[i]
+                self.point_vortex_volume[new_idx] = 0.5 * parent_volume
             else:
-                # 容量不足：回滚计数（尽量保持一致）
+                # Capacity reservation raced with another split.
                 ti.atomic_add(self.ss.segment_num[None], -1)
+                continue
 
             # 立即更新几何缓存（原段）
             d0 = self.ss.x_plus[i] - self.ss.x_minus[i]
@@ -2136,12 +2184,12 @@ class SegmentSolver:
                 self.ss.tangent[new_idx] = d1 / l1
                 self.ss.length[new_idx] = l1
 
-    def merge_segments(self):
+    def _merge_segments_legacy(self):
         """
         TODO（仅 3D）：
         合并满足以下条件的段对：
         - 中心距离 < mergeDistanceLambda
-        - 方向判据满足（近反向或你选定的判据）
+        - 带符号环量向量 Gamma*d 近似反向（夹角在 pi 的容差内）
         - 可选：gamma 兼容性判据
         """
         if not bool(self.ss.cfg.get_cfg("enableMergeSegments", True)):
@@ -2151,9 +2199,11 @@ class SegmentSolver:
             return
 
         merge_dist = float(self.ss.cfg.get_cfg("mergeDistanceLambda", 0.03))
-        merge_angle = float(self.ss.cfg.get_cfg("mergeAngleThreshold", 5.0 * np.pi / 6.0))
-        # 近反向：dot(t_i, t_j) <= cos(theta)，theta 接近 pi 时更严格
-        dot_th = float(np.cos(merge_angle))
+        merge_angle = float(self.ss.cfg.get_cfg("mergeAngleThreshold", np.pi / 4.0))
+        # The paper merges nearby segments whose signed circulation vectors
+        # are approximately opposing.  mergeAngleThreshold is the tolerance
+        # away from anti-parallel, so alignment must be <= -cos(theta).
+        dot_th = float(-np.cos(merge_angle))
         skip_merge_types = self._topology_skip_type_ids()
 
         x_minus = self.ss.x_minus.to_numpy()[:n].astype(np.float32)
@@ -2163,11 +2213,10 @@ class SegmentSolver:
         age = self.ss.age.to_numpy()[:n].astype(np.float32)
         seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
         center = self.ss.center.to_numpy()[:n].astype(np.float32)
-        tangent = self.ss.tangent.to_numpy()[:n].astype(np.float32)
-        length = self.ss.length.to_numpy()[:n].astype(np.float32)
         sph_v_minus = self.sph_advect_velocity_minus.to_numpy()[:n].astype(np.float32)
         sph_v_plus = self.sph_advect_velocity_plus.to_numpy()[:n].astype(np.float32)
         initial_remaining = self.initial_sph_advect_remaining.to_numpy()[:n].astype(np.int32)
+        point_vortex_volume = self.point_vortex_volume.to_numpy()[:n].astype(np.float32)
 
         used = np.zeros((n,), dtype=bool)
         out_xm = []
@@ -2200,7 +2249,22 @@ class SegmentSolver:
             best_j = -1
             best_d2 = 1e30
             ci = center[i]
-            ti = tangent[i]
+            # Segment orientation is arbitrary; compatibility must use the
+            # signed circulation vector Gamma*d, not the raw tangent alone.
+            wi = gamma[i] * (x_plus[i] - x_minus[i])
+            wi_norm = float(np.linalg.norm(wi))
+            if wi_norm <= 1e-12:
+                used[i] = True
+                out_xm.append(x_minus[i])
+                out_xp.append(x_plus[i])
+                out_g.append(gamma[i])
+                out_a.append(age[i])
+                out_t.append(seg_type[i])
+                out_vm.append(sph_v_minus[i])
+                out_vp.append(sph_v_plus[i])
+                out_rem.append(initial_remaining[i])
+                out_vol.append(point_vortex_volume[i])
+                continue
             for j in range(i + 1, n):
                 if active[j] != 1 or used[j]:
                     continue
@@ -2212,9 +2276,12 @@ class SegmentSolver:
                 d2 = float(np.sum((ci - center[j]) ** 2))
                 if d2 > merge_dist * merge_dist:
                     continue
-                # 方向判据：近反向
-                dotv = float(np.dot(ti, tangent[j]))
-                if dotv > dot_th:
+                wj = gamma[j] * (x_plus[j] - x_minus[j])
+                wj_norm = float(np.linalg.norm(wj))
+                if wj_norm <= 1e-12:
+                    continue
+                circulation_alignment = float(np.dot(wi, wj)) / (wi_norm * wj_norm)
+                if circulation_alignment > dot_th:
                     continue
                 if d2 < best_d2:
                     best_d2 = d2
@@ -2265,18 +2332,19 @@ class SegmentSolver:
             out_g.append(np.float32(g_new))
             out_a.append(np.float32(min(age[i], age[j])))
             out_t.append(seg_type[i])
+            merged_volume = point_vortex_volume[i] + point_vortex_volume[j]
             rem_i = int(initial_remaining[i])
             rem_j = int(initial_remaining[j])
             if rem_i >= rem_j:
                 out_vm.append(sph_v_minus[i])
                 out_vp.append(sph_v_plus[i])
                 out_rem.append(rem_i)
-                out_vol.append(point_vortex_volume[i])
+                out_vol.append(merged_volume)
             else:
                 out_vm.append(sph_v_minus[j])
                 out_vp.append(sph_v_plus[j])
                 out_rem.append(rem_j)
-                out_vol.append(point_vortex_volume[j])
+                out_vol.append(merged_volume)
 
         new_n = len(out_xm)
         if new_n <= 0:
@@ -2381,8 +2449,9 @@ class SegmentSolver:
         merge_dist = float(self.ss.cfg.get_cfg("mergeDistanceLambda", 0.03))
         if merge_dist <= 0.0:
             return
-        merge_angle = float(self.ss.cfg.get_cfg("mergeAngleThreshold", 5.0 * np.pi / 6.0))
-        dot_th = float(np.cos(merge_angle))
+        merge_angle = float(self.ss.cfg.get_cfg("mergeAngleThreshold", np.pi / 4.0))
+        # mergeAngleThreshold is the tolerance away from anti-parallel.
+        dot_th = float(-np.cos(merge_angle))
         skip_merge_types = self._topology_skip_type_ids()
         require_same_type = bool(self.ss.cfg.get_cfg("mergeRequireSameSegmentType", False))
 
@@ -2393,7 +2462,6 @@ class SegmentSolver:
         age = self.ss.age.to_numpy()[:n].astype(np.float32)
         seg_type = self.ss.seg_type.to_numpy()[:n].astype(np.int32)
         center = self.ss.center.to_numpy()[:n].astype(np.float32)
-        tangent = self.ss.tangent.to_numpy()[:n].astype(np.float32)
         sph_v_minus = self.sph_advect_velocity_minus.to_numpy()[:n].astype(np.float32)
         sph_v_plus = self.sph_advect_velocity_plus.to_numpy()[:n].astype(np.float32)
         initial_remaining = self.initial_sph_advect_remaining.to_numpy()[:n].astype(np.int32)
@@ -2454,7 +2522,22 @@ class SegmentSolver:
             best_j = -1
             best_d2 = 1e30
             ci = center[i]
-            ti = tangent[i]
+            # Segment endpoint order and signed Gamma jointly determine the
+            # physical circulation direction. Use Gamma*d for compatibility.
+            wi = gamma[i] * (x_plus[i] - x_minus[i])
+            wi_norm = float(np.linalg.norm(wi))
+            if wi_norm <= 1e-12:
+                used[i] = True
+                out_xm.append(x_minus[i])
+                out_xp.append(x_plus[i])
+                out_g.append(gamma[i])
+                out_a.append(age[i])
+                out_t.append(seg_type[i])
+                out_vm.append(sph_v_minus[i])
+                out_vp.append(sph_v_plus[i])
+                out_rem.append(initial_remaining[i])
+                out_vol.append(point_vortex_volume[i])
+                continue
             if use_hash:
                 if d == 2:
                     cell_i = (
@@ -2484,8 +2567,12 @@ class SegmentSolver:
                 d2 = float(np.dot(dc, dc))
                 if d2 > merge_dist2:
                     continue
-                dotv = float(np.dot(ti[:d], tangent[j, :d]))
-                if dotv > dot_th:
+                wj = gamma[j] * (x_plus[j] - x_minus[j])
+                wj_norm = float(np.linalg.norm(wj))
+                if wj_norm <= 1e-12:
+                    continue
+                circulation_alignment = float(np.dot(wi[:d], wj[:d])) / (wi_norm * wj_norm)
+                if circulation_alignment > dot_th:
                     continue
                 if d2 < best_d2:
                     best_d2 = d2
@@ -2531,18 +2618,19 @@ class SegmentSolver:
             out_g.append(np.float32(g_new))
             out_a.append(np.float32(min(age[i], age[j])))
             out_t.append(seg_type[i])
+            merged_volume = point_vortex_volume[i] + point_vortex_volume[j]
             rem_i = int(initial_remaining[i])
             rem_j = int(initial_remaining[j])
             if rem_i >= rem_j:
                 out_vm.append(sph_v_minus[i])
                 out_vp.append(sph_v_plus[i])
                 out_rem.append(rem_i)
-                out_vol.append(point_vortex_volume[i])
+                out_vol.append(merged_volume)
             else:
                 out_vm.append(sph_v_minus[j])
                 out_vp.append(sph_v_plus[j])
                 out_rem.append(rem_j)
-                out_vol.append(point_vortex_volume[j])
+                out_vol.append(merged_volume)
 
         new_n = len(out_xm)
         if new_n <= 0:

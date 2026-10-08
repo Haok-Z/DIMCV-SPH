@@ -43,6 +43,8 @@ import taichi as ti
 import matplotlib.pyplot as plt
 import numpy as np
 import time
+import os
+import tempfile
 from pathlib import Path
 from matplotlib.colors import Normalize, to_rgba
 from matplotlib.collections import LineCollection
@@ -54,6 +56,37 @@ from segment_config import SegmentConfig
 from segment_system import SegmentSystem
 from segment_solver import SegmentSolver
 from segment_export import SegmentExporter
+
+
+def _select_proportional_sign_indices(indices, strengths, signed_values, max_per):
+    """Select strongest candidates while preserving the available sign ratio."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.size <= max_per:
+        return indices
+    max_per = max(0, int(max_per))
+    if max_per == 0:
+        return indices[:0]
+    strengths = np.asarray(strengths)
+    signed_values = np.asarray(signed_values)
+    pos = indices[signed_values[indices] > 0.0]
+    neg = indices[signed_values[indices] < 0.0]
+    pos = pos[np.argsort(-strengths[pos])]
+    neg = neg[np.argsort(-strengths[neg])]
+    signed_total = int(pos.size + neg.size)
+    if signed_total == 0:
+        order = indices[np.argsort(-strengths[indices])]
+        return order[:max_per]
+    take_pos = min(int(round(max_per * pos.size / signed_total)), int(pos.size))
+    take_neg = min(max_per - take_pos, int(neg.size))
+    if take_pos + take_neg < max_per:
+        take_pos = min(int(pos.size), max_per - take_neg)
+    chosen = np.concatenate([pos[:take_pos], neg[:take_neg]])
+    if chosen.size < max_per:
+        chosen_set = set(int(i) for i in chosen.tolist())
+        rest = np.asarray([i for i in indices if int(i) not in chosen_set], dtype=indices.dtype)
+        rest = rest[np.argsort(-strengths[rest])]
+        chosen = np.concatenate([chosen, rest[: max_per - chosen.size]])
+    return chosen[:max_per]
 
 
 class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
@@ -68,6 +101,12 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self.seg_cfg = SegmentConfig(scene_file_path=path)
         self.ss_seg = SegmentSystem(self.seg_cfg)
         self.seg_solver = SegmentSolver(self.ss_seg)
+        self._residual_circulation_feedback = (
+            self.seg_solver.segment_strength_convention == "residual_circulation"
+        )
+        self._residual_circulation_persistent = bool(
+            self.seg_cfg.get_cfg("residualCirculationPersistent", False)
+        )
         self._initial_sph_advect_steps = max(
             1,
             int(self.seg_cfg.get_cfg("segmentInitialSphVelocitySteps", 1)),
@@ -141,6 +180,14 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self.u_seg_bs = ti.Vector.field(
             3, dtype=float, shape=self.ps.particle_max_num
         )
+        # Export-time diagnostics.  These are updated once per substep and
+        # sampled by KarmanVortexSolver.export_ply without changing dynamics.
+        self._spectrum_pre_feedback_velocity = ti.Vector.field(
+            3, dtype=float, shape=self.ps.particle_max_num
+        )
+        self._spectrum_segment_bs_velocity = ti.Vector.field(
+            3, dtype=float, shape=self.ps.particle_max_num
+        )
         self.u_vortex_ghost_sph = ti.Vector.field(
             self.ps.dim, dtype=float, shape=self.ps.particle_max_num
         )
@@ -204,6 +251,47 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             "transient",
             "impulse",
         )
+        if self._residual_circulation_feedback:
+            loss_sources = {
+                "vorticity_loss",
+                "loss",
+                "d_vort",
+                "vorticity_loss_pred",
+                "loss_pred",
+                "vorticity_loss_smoothed",
+                "loss_smoothed",
+                "d_vort_smoothed",
+            }
+            injection_source = str(
+                self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSource", "") or ""
+            ).lower().strip()
+            threshold_source = str(
+                self.seg_cfg.get_cfg(
+                    "sphBoundaryVorticityInjectionThresholdSource", injection_source
+                )
+                or injection_source
+            ).lower().strip()
+            if self._feedback_mode not in (
+                "bs_direct",
+                "direct_bs",
+                "biot_savart",
+                "bs",
+            ):
+                raise ValueError(
+                    "residual_circulation requires sphSegmentFeedbackMode='bs_direct'"
+                )
+            if injection_source not in loss_sources or threshold_source not in loss_sources:
+                raise ValueError(
+                    "residual_circulation requires the injection and threshold sources "
+                    "to be a vorticity-loss field (prefer 'vorticity_loss_smoothed')"
+                )
+            if abs(self.segment_bs_coupling_beta - 1.0) > 1e-8:
+                raise ValueError(
+                    "residual_circulation requires sphSegmentBsCoupling=1.0 because "
+                    "the segment field is the one-step correction"
+                )
+            if self._residual_circulation_persistent:
+                self._one_step_vortex_impulse = False
         self.vortex_ghost_num = ti.field(dtype=ti.i32, shape=())
         self.vortex_ghost_x = ti.Vector.field(
             self.ps.dim, dtype=float, shape=self.ss_seg.segment_max_num
@@ -417,6 +505,11 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         centers = centers[valid].astype(np.float64, copy=False)
         gamma = gamma[valid].astype(np.float64, copy=False)
         volume = volume[valid].astype(np.float64, copy=False)
+        nseg = int(self.ss_seg.segment_num[None])
+        xm_all = self.ss_seg.x_minus.to_numpy()[:nseg, : centers.shape[1]]
+        xp_all = self.ss_seg.x_plus.to_numpy()[:nseg, : centers.shape[1]]
+        active_idx = self._active_point_vortex_gamma_arrays()[3]
+        dvec = (xp_all[active_idx][valid] - xm_all[active_idx][valid]).astype(np.float64, copy=False)
         support = float(support_radius)
         if support <= 1e-12:
             return out
@@ -454,7 +547,15 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             w = self._cubic_kernel_np(rn[near], support)
             wsum = float(np.sum(volume[ids] * w))
             if wsum > 1e-12:
-                out[i, 2] = float(np.sum(w * gamma[ids]) / wsum)
+                if dim == 2:
+                    out[i, 2] = float(np.sum(w * gamma[ids]) / wsum)
+                else:
+                    if self.seg_solver.segment_strength_convention != "legacy_mixed":
+                        beta = gamma[ids, None] * dvec[ids]
+                    else:
+                        beta = np.zeros((ids.size, 3), dtype=np.float64)
+                        beta[:, 2] = gamma[ids]
+                    out[i, :dim] = (np.sum(w[:, None] * beta, axis=0) / wsum).astype(np.float32)
         return out
 
     def _estimate_vortex_omega_from_velocity_curl_at_points(self, points, support_radius: float):
@@ -517,7 +618,10 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSource", "vorticity")
             or "vorticity"
         ).lower().strip()
-        if vort_src in ("vorticity_loss", "loss", "d_vort", "vorticity_loss_pred", "loss_pred", "vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
+        if (
+            vort_src in ("vorticity_loss", "loss", "d_vort", "vorticity_loss_pred", "loss_pred", "vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed")
+            and not self._residual_circulation_feedback
+        ):
             self.compute_v_star()
             self.compute_vorticity()
             self.compute_grad_v()
@@ -525,6 +629,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 self.compute_vorticity_pred()
                 self.compute_d_vorticity_pred()
             else:
+                if self.vorticity_loss_use_pred:
+                    self.compute_vorticity_pred()
                 self.compute_d_vorticity()
             if vort_src in ("vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
                 self.compute_all_d_vort_smoothed()
@@ -552,6 +658,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     self.compute_vorticity_pred()
                     self.compute_d_vorticity_pred()
                 else:
+                    if self.vorticity_loss_use_pred:
+                        self.compute_vorticity_pred()
                     self.compute_d_vorticity()
                 if threshold_src in ("vorticity_loss_smoothed", "loss_smoothed", "d_vort_smoothed"):
                     self.compute_all_d_vort_smoothed()
@@ -637,37 +745,9 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             ).lower().strip()
             strength = threshold_mag[idx]
             if selection in ("proportional_sign", "sign_proportional", "weighted_sign", "ratio_sign"):
-                threshold_omega_z = threshold_vort[:, 2]
-                sign_src = threshold_omega_z[idx]
-                pos = idx[sign_src > 0.0]
-                neg = idx[sign_src < 0.0]
-                pos = pos[np.argsort(-threshold_mag[pos])]
-                neg = neg[np.argsort(-threshold_mag[neg])]
-                n_pos = int(pos.size)
-                n_neg = int(neg.size)
-                n_signed = n_pos + n_neg
-                if n_signed > 0:
-                    take_pos = int(round(float(max_per) * float(n_pos) / float(n_signed)))
-                    take_pos = max(0, min(max_per, take_pos))
-                    take_neg = max_per - take_pos
-                else:
-                    take_pos = 0
-                    take_neg = 0
-                take_pos = min(take_pos, n_pos)
-                take_neg = min(take_neg, n_neg)
-                chosen_parts = []
-                if take_pos > 0:
-                    chosen_parts.append(pos[:take_pos])
-                if take_neg > 0:
-                    chosen_parts.append(neg[:take_neg])
-                chosen = np.concatenate(chosen_parts) if chosen_parts else np.zeros((0,), dtype=idx.dtype)
-                if chosen.size < max_per:
-                    chosen_set = set(int(i) for i in chosen.tolist())
-                    rest = np.array([int(i) for i in idx if int(i) not in chosen_set], dtype=idx.dtype)
-                    if rest.size > 0:
-                        rest = rest[np.argsort(-threshold_mag[rest])]
-                        chosen = np.concatenate([chosen, rest[: max_per - chosen.size]])
-                idx = chosen.astype(idx.dtype, copy=False)
+                idx = _select_proportional_sign_indices(
+                    idx, threshold_mag, threshold_vort[:, 2], max_per
+                ).astype(idx.dtype, copy=False)
             elif selection in ("balanced_sign", "sign_balanced", "pos_neg", "positive_negative"):
                 threshold_omega_z = threshold_vort[:, 2]
                 sign_src = threshold_omega_z[idx]
@@ -695,6 +775,9 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 pick = np.argpartition(-strength, max_per - 1)[:max_per]
                 idx = idx[pick]
 
+        # In persistent residual mode, selection is still seeded from the
+        # configured source field, but weak residuals must not create a new
+        # segment merely because the full SPH field is strong nearby.
         selected_threshold_z = threshold_vort[idx, 2].astype(np.float32, copy=False)
         selected_pos = int(np.sum(selected_threshold_z > 0.0))
         selected_neg = int(np.sum(selected_threshold_z < 0.0))
@@ -708,15 +791,58 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             or "omega"
         ).lower().strip()
         dim = int(self.ps.dim)
+        centers = x[idx, :dim].astype(np.float32, copy=False)
+        gamma_source_vort = vort
+        residual_enabled = bool(
+            self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionUseResidualVorticity", False)
+        ) or vort_src in (
+            "vorticity_residual",
+            "residual_vorticity",
+            "vorticity_minus_vortex",
+            "sph_vorticity_residual",
+        )
+        residual_enabled = residual_enabled or (
+            self._residual_circulation_feedback
+            and self._residual_circulation_persistent
+        )
+        omega_vortex_gamma_sel = None
+        omega_vortex_curl_sel = None
+        residual_source_norm = None
+        residual_norm = None
+        residual_near_zero = 0
+        if residual_enabled:
+            support = float(
+                self.ps.support_radius
+                * float(self.seg_cfg.get_cfg("sphBoundaryVortexResidualSupportRadiusScale", 1.0))
+            )
+            omega_vortex_gamma_sel = self._estimate_vortex_omega_from_gamma_at_points(
+                centers, support
+            )
+            gamma_source_vort = vort.copy()
+            gamma_source_vort[idx, :3] = vort[idx, :3] - omega_vortex_gamma_sel[:, :3]
+            residual_source_norm = np.linalg.norm(vort[idx, :3], axis=1)
+            residual_norm = np.linalg.norm(gamma_source_vort[idx, :3], axis=1)
+            residual_near_zero = int(np.count_nonzero(residual_norm <= 1e-8))
+            if bool(self.seg_cfg.get_cfg("sphBoundaryVorticityResidualDebug", False)):
+                omega_vortex_curl_sel = self._estimate_vortex_omega_from_velocity_curl_at_points(
+                    centers, support
+                )
         tangent = np.zeros((idx.size, dim), dtype=np.float32)
         if dim == 3 and orientation in ("auto", "omega", "vorticity", "vorticity_direction"):
-            tangent = vort[idx, :3].astype(np.float32, copy=True)
+            direction_source = gamma_source_vort[idx, :3] if residual_enabled else vort[idx, :3]
+            tangent = direction_source.astype(np.float32, copy=True)
             tn = np.linalg.norm(tangent, axis=1, keepdims=True)
             weak = tn[:, 0] < 1e-8
             tangent = tangent / (tn + 1e-8)
-            tangent[weak, 0] = 1.0
-            tangent[weak, 1] = 0.0
-            tangent[weak, 2] = 0.0
+            if residual_enabled:
+                fallback = vort[idx, :3].astype(np.float32, copy=True)
+                fallback_norm = np.linalg.norm(fallback, axis=1, keepdims=True)
+                fallback = fallback / (fallback_norm + 1e-8)
+                tangent[weak] = fallback[weak]
+            else:
+                tangent[weak, 0] = 1.0
+                tangent[weak, 1] = 0.0
+                tangent[weak, 2] = 0.0
         else:
             use_circle_tangent = orientation in ("circle", "circle_tangent", "boundary_tangent") or (
                 orientation == "auto" and region not in ("all", "global", "whole_domain", "domain", "anywhere")
@@ -744,52 +870,54 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         if dim == 2 and bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionOrientBySign", True)):
             tangent *= sign[:, None]
 
-        centers = x[idx, :dim].astype(np.float32, copy=False)
         xm_d = centers - np.float32(0.5 * seg_len) * tangent
         xp_d = centers + np.float32(0.5 * seg_len) * tangent
         xm = np.zeros((idx.size, 3), dtype=np.float32)
         xp = np.zeros((idx.size, 3), dtype=np.float32)
         xm[:, :dim] = xm_d
         xp[:, :dim] = xp_d
-        gamma_source_vort = vort
-        residual_enabled = bool(
-            self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionUseResidualVorticity", False)
-        ) or vort_src in (
-            "vorticity_residual",
-            "residual_vorticity",
-            "vorticity_minus_vortex",
-            "sph_vorticity_residual",
-        )
-        omega_vortex_gamma_sel = None
-        omega_vortex_curl_sel = None
-        if residual_enabled:
-            support = float(
-                self.ps.support_radius
-                * float(self.seg_cfg.get_cfg("sphBoundaryVortexResidualSupportRadiusScale", 1.0))
-            )
-            omega_vortex_gamma_sel = self._estimate_vortex_omega_from_gamma_at_points(
-                centers, support
-            )
-            gamma_source_vort = vort.copy()
-            gamma_source_vort[idx, :3] = vort[idx, :3] - omega_vortex_gamma_sel[:, :3]
-            if bool(self.seg_cfg.get_cfg("sphBoundaryVorticityResidualDebug", False)):
-                omega_vortex_curl_sel = self._estimate_vortex_omega_from_velocity_curl_at_points(
-                    centers, support
-                )
         gamma_mode = str(
             self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionGammaMode", "omega_dot_t")
             or "omega_dot_t"
         ).lower().strip()
+        # d_vort_smoothed already contains the SPH volume-weighted integral;
+        # raw d_vort is a point vorticity and still needs m_V here.
+        source_has_volume = vort_src in (
+            "vorticity_loss_smoothed",
+            "loss_smoothed",
+            "d_vort_smoothed",
+        )
+        gamma_volume = np.ones_like(mv) if source_has_volume else mv
         gamma_omega_z = gamma_source_vort[:, 2]
-        if gamma_mode in ("omega_norm", "source_norm", "norm", "magnitude"):
+        if dim == 3 and residual_enabled and orientation in ("auto", "omega", "vorticity", "vorticity_direction"):
+            gamma = (gamma_scale * residual_norm * gamma_volume[idx]).astype(np.float32)
+        elif gamma_mode in ("omega_norm", "source_norm", "norm", "magnitude"):
             gamma_omega_mag = np.linalg.norm(gamma_source_vort, axis=1).astype(np.float32)
-            gamma = (gamma_scale * gamma_omega_mag[idx] * mv[idx]).astype(np.float32)
+            gamma = (gamma_scale * gamma_omega_mag[idx] * gamma_volume[idx]).astype(np.float32)
         elif gamma_mode in ("omega_dot_t", "source_dot_t", "dot_t", "projection"):
-            gamma = (gamma_scale * np.sum(gamma_source_vort[idx, :dim] * tangent, axis=1) * mv[idx]).astype(np.float32)
+            gamma = (gamma_scale * np.sum(gamma_source_vort[idx, :dim] * tangent, axis=1) * gamma_volume[idx]).astype(np.float32)
         elif gamma_mode in ("source_component", "omega_component", "z", "z_component"):
-            gamma = (gamma_scale * gamma_omega_z[idx] * mv[idx]).astype(np.float32)
+            gamma = (gamma_scale * gamma_omega_z[idx] * gamma_volume[idx]).astype(np.float32)
         else:
-            gamma = (gamma_scale * gamma_omega_z[idx] * mv[idx]).astype(np.float32)
+            gamma = (gamma_scale * gamma_omega_z[idx] * gamma_volume[idx]).astype(np.float32)
+
+        # In the paper convention gamma is the segment circulation Gamma.
+        # The SPH quantity omega * volume is a vortex-strength vector beta;
+        # projecting beta onto d = L*t requires division by the segment length.
+        if dim == 3 and self.seg_solver.segment_strength_convention != "legacy_mixed":
+            gamma = gamma / np.float32(max(seg_len, 1e-8))
+
+        residual_gamma_threshold = float(
+            self.seg_cfg.get_cfg("sphBoundaryVorticityResidualGammaThreshold", 0.0)
+        )
+        if residual_enabled and residual_gamma_threshold > 0.0:
+            keep = np.abs(gamma) >= np.float32(residual_gamma_threshold)
+            idx = idx[keep]
+            xm = xm[keep]
+            xp = xp[keep]
+            gamma = gamma[keep]
+            if idx.size == 0:
+                return
 
         offset = int(self.ss_seg.segment_num[None])
         cap = int(self.ss_seg.segment_max_num)
@@ -830,11 +958,19 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 f"gamma_new={float(gamma[dbg_local]):.6e}"
             )
         if bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSignDebug", False)):
+            residual_msg = ""
+            if residual_enabled and residual_source_norm is not None:
+                residual_msg = (
+                    f" residual_norm_mean={float(np.mean(residual_norm)):.6e}"
+                    f" source_norm_mean={float(np.mean(residual_source_norm)):.6e}"
+                    f" near_zero={residual_near_zero}"
+                )
             print(
                 f"[sph-vort-inject-sign] step={step} "
                 f"candidate(+/-/0)={candidate_pos}/{candidate_neg}/{candidate_zero} "
                 f"selected(+/-/0)={selected_pos}/{selected_neg}/{selected_zero} "
                 f"gamma(+/-/0)={gamma_pos}/{gamma_neg}/{gamma_zero}"
+                f" residual_enabled={int(residual_enabled)}{residual_msg}"
             )
         if bool(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionLog", False)):
             print(
@@ -1214,7 +1350,7 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 if inside_region == 1 and threshold_mag >= threshold:
                     k = ti.atomic_add(self._gpu_vorticity_injection_count[None], 1)
                     if k < max_new:
-                        omega_vortex_z = 0.0
+                        omega_vortex = ti.Vector([0.0, 0.0, 0.0])
                         wsum = 0.0
                         if support_radius > 1e-12:
                             for j in range(segment_count):
@@ -1227,22 +1363,34 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                                             w = self._cubic_kernel_ti(rn, support_radius)
                                             vol = self.seg_solver.point_vortex_volume[j]
                                             if vol > 1e-12:
-                                                omega_vortex_z += w * self.ss_seg.gamma[j]
+                                                if self.seg_solver._use_paper_circulation[None] == 1:
+                                                    dseg = self.ss_seg.x_plus[j] - self.ss_seg.x_minus[j]
+                                                    omega_vortex += w * self.ss_seg.gamma[j] * dseg
+                                                else:
+                                                    omega_vortex[2] += w * self.ss_seg.gamma[j]
                                                 wsum += vol * w
                         residual = omega
                         if wsum > 1e-12:
-                            residual[2] = omega[2] - omega_vortex_z / wsum
-                        tangent = omega
+                            residual -= omega_vortex / wsum
+                        tangent = residual
                         tn = tangent.norm()
                         if tn > 1e-8:
                             tangent = tangent / tn
                         else:
-                            tangent = ti.Vector([1.0, 0.0, 0.0])
+                            tangent = omega
+                            tn = tangent.norm()
+                            if tn > 1e-8:
+                                tangent = tangent / tn
+                            else:
+                                tangent = ti.Vector([1.0, 0.0, 0.0])
                         half = 0.5 * seg_len
                         i = offset + k
                         self.ss_seg.x_minus[i] = pos - half * tangent
                         self.ss_seg.x_plus[i] = pos + half * tangent
-                        self.ss_seg.gamma[i] = gamma_scale * residual.dot(tangent) * self.ps.m_V[p]
+                        g = gamma_scale * residual.norm() * self.ps.m_V[p]
+                        if self.seg_solver._use_paper_circulation[None] == 1:
+                            g /= seg_len + 1e-8
+                        self.ss_seg.gamma[i] = g
                         self.ss_seg.active[i] = 1
                         self.ss_seg.age[i] = 0.0
                         self.ss_seg.seg_type[i] = seg_type_id
@@ -1439,7 +1587,10 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         point_vortex_volume = self.seg_solver.point_vortex_volume.to_numpy()[:n].astype(np.float32)
         v_minus = self.seg_solver.v_minus.to_numpy()[:n, :dim].astype(np.float32)
         v_plus = self.seg_solver.v_plus.to_numpy()[:n, :dim].astype(np.float32)
-        speed = np.linalg.norm(0.5 * (v_minus + v_plus), axis=1)
+        speed = np.maximum(
+            np.linalg.norm(v_minus, axis=1),
+            np.linalg.norm(v_plus, axis=1),
+        )
         candidate = (
             (active == 1)
             & (seg_type != boundary_type)
@@ -1881,8 +2032,9 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 if inside:
                     keep = False
             if keep and delete_slow == 1 and target_slow and st != boundary_type:
-                v = 0.5 * (self.seg_solver.v_minus[i] + self.seg_solver.v_plus[i])
-                if v.norm() < slow_threshold:
+                speed_minus = self.seg_solver.v_minus[i].norm()
+                speed_plus = self.seg_solver.v_plus[i].norm()
+                if ti.max(speed_minus, speed_plus) < slow_threshold:
                     keep = False
             if keep and enable_weak == 1 and not skip:
                 if ti.abs(self.ss_seg.gamma[i]) < gamma_threshold:
@@ -1962,8 +2114,9 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 if inside:
                     keep = False
             if keep and delete_slow == 1 and target_slow and st != boundary_type:
-                v = 0.5 * (self.seg_solver.v_minus[i] + self.seg_solver.v_plus[i])
-                if v.norm() < slow_threshold:
+                speed_minus = self.seg_solver.v_minus[i].norm()
+                speed_plus = self.seg_solver.v_plus[i].norm()
+                if ti.max(speed_minus, speed_plus) < slow_threshold:
                     keep = False
             if keep and enable_weak == 1 and not skip:
                 if ti.abs(self.ss_seg.gamma[i]) < gamma_threshold:
@@ -2065,6 +2218,9 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         def residual_vorticity_injection():
             self._inject_segments_from_sph_boundary_vorticity()
 
+        def persistent_residual_update():
+            self._update_persistent_residual_segments()
+
         def update_segment_geometry_pre():
             ssol.ss.update_segment_geometry()
 
@@ -2097,15 +2253,27 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     int(self._sph_velocity_to_segment_skip_type),
                 )
 
+        # Instant residual mode uses one-step correction segments. Persistent
+        # mode keeps the existing segments and relaxes their circulation below.
+        if self._residual_circulation_feedback and not self._residual_circulation_persistent:
+            run_stage(
+                "clear_previous_residual_segments",
+                self._clear_one_step_internal_point_vortices,
+            )
+
         run_stage("sync_moving_cylinder", self._sync_moving_cylinder_to_segment_config)
         run_stage("boundary_pipeline", boundary_pipeline)
         run_stage("periodic_emit", periodic_emit)
+        run_stage("persistent_residual_update", persistent_residual_update)
         run_stage("residual_vorticity_injection", residual_vorticity_injection)
         run_stage("update_segment_geometry_pre", update_segment_geometry_pre)
         run_stage("vorticity_deposit_to_segments", vorticity_deposit_to_segments)
         run_stage("sph_velocity_deposit_to_segments", sph_velocity_deposit_to_segments)
 
-        if self._one_step_vortex_impulse:
+        if self._residual_circulation_feedback and not self._residual_circulation_persistent:
+            run_stage("delete_inside_obstacles", self._delete_interior_segments_inside_obstacles)
+            run_stage("update_segment_geometry_post", ssol.ss.update_segment_geometry)
+        elif self._one_step_vortex_impulse:
             run_stage("delete_inside_obstacles", self._delete_interior_segments_inside_obstacles)
             old_bg = int(ssol._segment_advect_use_background[None])
             old_sph = int(ssol._segment_advect_use_sph[None])
@@ -2122,7 +2290,17 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             sph_advect_bs_ghost = bool(
                 self.seg_cfg.get_cfg("segmentSphAdvectButGhostUseBsVelocity", False)
             )
-            if sph_advect_bs_ghost:
+            sph_only_fast = (
+                not sph_advect_bs_ghost
+                and int(ssol._segment_advect_use_bs[None]) == 0
+                and int(ssol._segment_advect_use_sph[None]) == 1
+                and int(ssol._segment_advect_use_background[None]) == 0
+                and not ssol._advect_fix_segment_center
+                and not ssol._advect_fix_segment_length
+            )
+            if sph_only_fast:
+                run_stage("advect_segments_sph_only", ssol.advect_segments_sph_only)
+            elif sph_advect_bs_ghost:
                 old_bg = int(ssol._segment_advect_use_background[None])
                 old_sph = int(ssol._segment_advect_use_sph[None])
                 old_bs = int(ssol._segment_advect_use_bs[None])
@@ -2387,6 +2565,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     if dot_ot < 0.0:
                         om_eff = -nrm
                 g_tgt = gamma_scale * om_eff
+                if self.seg_solver._use_paper_circulation[None] == 1:
+                    g_tgt /= self.ss_seg.length[i] + 1e-8
                 gamma_new = (1.0 - blend) * self.ss_seg.gamma[i] + blend * g_tgt
                 self.ss_seg.gamma[i] = gamma_new
                 if dbg != 0:
@@ -2414,6 +2594,55 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             self._deposit_vorticity_to_segments_3d_kernel(
                 blend, gamma_scale, mf, proj_mode, src_vis, dbg, int(skip_seg_type)
             )
+
+    @ti.kernel
+    def _update_persistent_residual_segments_3d(
+        self, blend: float, mf: ti.i32, seg_type: ti.i32
+    ):
+        """Relax existing residual segments toward the current loss field.
+
+        The target uses omega_loss * particle volume / segment length, so the
+        stored value is the physical circulation Gamma. This is a target blend,
+        not an additive deposit, which prevents repeated loss accumulation.
+        """
+        h = self.ps.support_radius
+        nseg = self.ss_seg.segment_num[None]
+        for i in range(nseg):
+            if self.ss_seg.active[i] != 1 or self.ss_seg.seg_type[i] != seg_type:
+                continue
+            xc = self.ss_seg.center[i]
+            tangent = self.ss_seg.tangent[i]
+            omega_acc = ti.Vector([0.0, 0.0, 0.0])
+            wsum = 0.0
+            for p in range(self.ps.particle_num[None]):
+                if self.ps.material[p] != mf:
+                    continue
+                r = xc - self.ps.x[p]
+                rn = r.norm()
+                if rn >= h:
+                    continue
+                w = self.ps.m_V[p] * self.cubic_kernel(rn)
+                omega_acc += w * self.d_vort[p]
+                wsum += w
+            if wsum > 1e-12:
+                omega = omega_acc / wsum
+                target = omega.dot(tangent) * self.seg_solver.point_vortex_volume[i]
+                target /= self.ss_seg.length[i] + 1e-8
+                self.ss_seg.gamma[i] = (1.0 - blend) * self.ss_seg.gamma[i] + blend * target
+
+    def _update_persistent_residual_segments(self):
+        if not (self._residual_circulation_feedback and self._residual_circulation_persistent):
+            return
+        # Persistent residual segments are conservative by default.  A
+        # positive blend is an explicit SPH-nudging compatibility mode.
+        blend = float(self.seg_cfg.get_cfg("residualSegmentGammaBlend", 0.0))
+        if blend <= 0.0:
+            return
+        self._update_persistent_residual_segments_3d(
+            min(1.0, blend),
+            int(self.ps.material_fluid),
+            int(self.seg_cfg.get_cfg("sphBoundaryVorticityInjectionSegmentTypeId", 0)),
+        )
 
     @ti.func
     def _vortex_ghost_cubic_kernel(self, r_norm: float, support_radius: float):
@@ -2803,6 +3032,34 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                 int(self.ps.material_fluid),
             )
 
+    @ti.kernel
+    def _cache_spectrum_pre_feedback_velocity(self):
+        for p in range(self.ps.particle_num[None]):
+            for d in ti.static(range(3)):
+                if d < self.ps.dim:
+                    self._spectrum_pre_feedback_velocity[p][d] = self.ps.v[p][d]
+                else:
+                    self._spectrum_pre_feedback_velocity[p][d] = 0.0
+
+    @ti.kernel
+    def _cache_spectrum_direct_bs_velocity(self, use_ghost: ti.i32):
+        for p in range(self.ps.particle_num[None]):
+            for d in ti.static(range(3)):
+                if d < self.ps.dim:
+                    if use_ghost != 0:
+                        self._spectrum_segment_bs_velocity[p][d] = self.u_vortex_ghost_sph[p][d]
+                    else:
+                        self._spectrum_segment_bs_velocity[p][d] = self.u_seg_bs[p][d]
+                else:
+                    self._spectrum_segment_bs_velocity[p][d] = 0.0
+
+    def ply_extra_vector_fields(self, particle_count):
+        """Return non-invasive Hybrid diagnostics for the common SPH PLY writer."""
+        return {
+            "pre_feedback_vel": self._spectrum_pre_feedback_velocity.to_numpy()[:particle_count],
+            "segment_bs_vel": self._spectrum_segment_bs_velocity.to_numpy()[:particle_count],
+        }
+
     def _apply_vortex_ghost_displacement_feedback(self):
         if not self._vortex_ghost_displacement_feedback:
             return
@@ -2812,6 +3069,18 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self._debug_print_sph_ghost_velocity(
             "after_displacement", int(self._debug_last_residual_particle)
         )
+
+    def _prepare_residual_circulation_loss(self):
+        """Compute DIMCV's one-step numerical vorticity loss before v is predicted."""
+        if not self._residual_circulation_feedback:
+            return
+        self.compute_v_star()
+        self.compute_vorticity()
+        self.compute_grad_v()
+        if self.vorticity_loss_use_pred:
+            self.compute_vorticity_pred()
+        self.compute_d_vorticity()
+        self.compute_all_d_vort_smoothed()
 
     def substep(self):
         timing = self._substep_timing_enabled and (
@@ -2837,12 +3106,18 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         run_stage("compute_DFSPH_factor", self.compute_DFSPH_factor)
         run_stage("divergence_solve", self.divergence_solve)
         run_stage("compute_non_pressure_forces", self.compute_non_pressure_forces)
+        run_stage("prepare_residual_circulation_loss", self._prepare_residual_circulation_loss)
         run_stage("predict_velocity", self.predict_velocity)
         run_stage("compute_vorticity_pre", self.compute_vorticity)
         run_stage("compute_vorticity_vis_pre", self.compute_vorticity_vis)
         run_stage("print_sph_vorticity_debug", self._print_sph_vorticity_debug)
         run_stage("advance_segments_coupled", self._advance_segments_coupled)
+        run_stage("cache_spectrum_pre_feedback", self._cache_spectrum_pre_feedback_velocity)
         run_stage("apply_segment_feedback_to_sph", self._apply_segment_feedback_to_sph)
+        run_stage(
+            "cache_spectrum_segment_bs",
+            lambda: self._cache_spectrum_direct_bs_velocity(int(self._vortex_ghost_feedback)),
+        )
         run_stage("pressure_solve", self.pressure_solve)
         run_stage(
             "ghost_velocity_debug_after_pressure",
@@ -2907,21 +3182,29 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         alpha = float(self.seg_cfg.get_cfg("imageBoundarySegmentAlpha", 0.95))
         return btype, show, tuple(color.tolist()), lw, alpha
 
-    def _active_segment_index_groups(self, n_seg: int):
+    def _active_segment_index_groups(self, n_seg: int, segment_snapshot=None):
         """将活跃段分为内部段与边界虚拟段索引。"""
         if n_seg <= 0:
             return (
                 np.zeros((0,), dtype=np.int64),
                 np.zeros((0,), dtype=np.int64),
             )
-        act = self.ss_seg.active.to_numpy()[:n_seg]
+        act = (
+            segment_snapshot["active"][:n_seg]
+            if segment_snapshot is not None
+            else self.ss_seg.active.to_numpy()[:n_seg]
+        )
         idx = np.nonzero(act == 1)[0]
         if idx.size == 0:
             return idx, idx
         btype, show_bnd, _, _, _ = self._boundary_segment_draw_style()
         if not show_bnd:
             return idx, np.zeros((0,), dtype=np.int64)
-        seg_type = self.ss_seg.seg_type.to_numpy()[:n_seg]
+        seg_type = (
+            segment_snapshot["seg_type"][:n_seg]
+            if segment_snapshot is not None
+            else self.ss_seg.seg_type.to_numpy()[:n_seg]
+        )
         is_bnd = seg_type[idx] == btype
         return idx[~is_bnd], idx[is_bnd]
 
@@ -3165,7 +3448,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         ax.set_axis_off()
         plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
         transparent = bool(self.seg_cfg.get_cfg("imageVortexGhostPanelTransparent", False))
-        plt.savefig(
+        self._save_png_resilient(
+            fig,
             dir_ghost / f"vorticity_{cnt:04}.png",
             bbox_inches="tight",
             pad_inches=0,
@@ -3333,8 +3617,51 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         )
         ax.add_collection3d(lc)
 
+    @staticmethod
+    def _save_png_resilient(fig, path, **kwargs):
+        """Save through a temporary sibling file and tolerate a locked old frame."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{path.stem}_", suffix=".png", dir=path.parent, delete=False
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+            fig.savefig(temp_path, format="png", **kwargs)
+            last_error = None
+            for attempt in range(5):
+                try:
+                    os.replace(temp_path, path)
+                    return True
+                except PermissionError as exc:
+                    last_error = exc
+                    if attempt < 4:
+                        time.sleep(0.2 * (attempt + 1))
+            print(f"[image-export-warning] could not replace {path}: {last_error}; frame skipped")
+            return False
+        except PermissionError as exc:
+            print(f"[image-export-warning] could not write {path}: {exc}; frame skipped")
+            return False
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     def export_png(self, cnt, image_path):
         """SPH 与涡段分目录导出；涡段颜色 = 段心处与粒子相同的 m_V*W 加权 vorticity_vis.z。"""
+        snapshot = self._get_export_snapshot()
+        n_seg = int(self.ss_seg.segment_num[None])
+        snapshot["segments"] = {
+            "segment_num": n_seg,
+            "x_minus": self.ss_seg.x_minus.to_numpy()[:n_seg].copy(),
+            "x_plus": self.ss_seg.x_plus.to_numpy()[:n_seg].copy(),
+            "gamma": self.ss_seg.gamma.to_numpy()[:n_seg].copy(),
+            "active": self.ss_seg.active.to_numpy()[:n_seg].copy(),
+            "seg_type": self.ss_seg.seg_type.to_numpy()[:n_seg].copy(),
+        }
         if self.ps.dim == 2:
             self._export_png_2d(cnt, image_path)
             return
@@ -3358,14 +3685,14 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             vmin=self._img_vort_vmin, vmax=self._img_vort_vmax
         )
 
-        N = self.ps.particle_num[None]
-        material = self.ps.material.to_numpy()[:N]
-        obj_id = self.ps.object_id.to_numpy()[:N]
+        N = snapshot["particle_num"]
+        material = snapshot["material"]
+        obj_id = snapshot["object_id"]
         fluid_mask = material == self.ps.material_fluid
         solid_mask = (obj_id == 2)
 
-        x = self.x_temp.to_numpy()[:N]
-        vort = self.ps.vorticity_vis.to_numpy()[:N][:, 2]
+        x = snapshot["x"]
+        vort = snapshot["vorticity_vis"][:, 2]
 
         fluid_x = x[fluid_mask]
         fluid_vort = vort[fluid_mask]
@@ -3400,7 +3727,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         ax.set_box_aspect(tuple(float(v) for v in domain_extent))
         ax.set_axis_off()
         plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-        plt.savefig(
+        self._save_png_resilient(
+            fig,
             dir_sph / f"vorticity_{cnt:04}.png",
             bbox_inches="tight",
             pad_inches=0,
@@ -3412,7 +3740,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
 
         # --- [EXPORT] 涡段图（按段心涡量 z 分量着色，色标与 SPH 一致）---
         if self._export_segment_panel:
-            n_seg = int(self.ss_seg.segment_num[None])
+            seg_snapshot = snapshot["segments"]
+            n_seg = seg_snapshot["segment_num"]
             fig2 = plt.figure(figsize=(fig_width, fig_height), dpi=200)
             ax2 = fig2.add_subplot(111, projection="3d")
             ax2.view_init(elev=30, azim=-60)
@@ -3426,11 +3755,11 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     edgecolors="none",
                 )
             if n_seg > 0:
-                xm = self.ss_seg.x_minus.to_numpy()[:n_seg]
-                xp = self.ss_seg.x_plus.to_numpy()[:n_seg]
-                idx_int, idx_bnd = self._active_segment_index_groups(n_seg)
+                xm = seg_snapshot["x_minus"]
+                xp = seg_snapshot["x_plus"]
+                idx_int, idx_bnd = self._active_segment_index_groups(n_seg, seg_snapshot)
                 if idx_int.size > 0:
-                    gamma_values = self.ss_seg.gamma.to_numpy()[:n_seg]
+                    gamma_values = seg_snapshot["gamma"]
                     scalars = gamma_values[idx_int].astype(np.float64)
                     seg_norm = self._segment_gamma_color_norm(scalars)
                     self._add_interior_segments_3d(ax2, xm, xp, idx_int, scalars, seg_norm)
@@ -3441,7 +3770,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             ax2.set_box_aspect(tuple(float(v) for v in domain_extent))
             ax2.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-            plt.savefig(
+            self._save_png_resilient(
+                fig2,
                 dir_seg / f"vorticity_{cnt:04}.png",
                 bbox_inches="tight",
                 pad_inches=0,
@@ -3463,14 +3793,15 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         ds = self.ps.domain_start
         de = self.ps.domain_end
 
-        N = self.ps.particle_num[None]
-        material = self.ps.material.to_numpy()[:N]
-        obj_id = self.ps.object_id.to_numpy()[:N]
+        snapshot = self._get_export_snapshot()
+        N = snapshot["particle_num"]
+        material = snapshot["material"]
+        obj_id = snapshot["object_id"]
         fluid_mask = material == self.ps.material_fluid
         solid_mask = (obj_id == 1) | (obj_id == 2)
 
-        x = self.x_temp.to_numpy()[:N]
-        vort_np = self.ps.vorticity_vis.to_numpy()[:N]
+        x = snapshot["x"]
+        vort_np = snapshot["vorticity_vis"]
         vort = vort_np[:, 2] if vort_np.shape[1] > 2 else vort_np[:, 0]
 
         fluid_x = x[fluid_mask]
@@ -3516,7 +3847,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         ax.set_aspect("equal", adjustable="box")
         ax.set_axis_off()
         plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-        plt.savefig(
+        self._save_png_resilient(
+            fig,
             dir_sph / f"vorticity_{cnt:04}.png",
             bbox_inches="tight", pad_inches=0, transparent=True, dpi=400,
         )
@@ -3524,7 +3856,20 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         self._export_vortex_ghost_png_2d(cnt, dir_ghost, ds, de)
 
         if self._export_segment_panel:
-            n_seg = int(self.ss_seg.segment_num[None])
+            seg_snapshot = snapshot.get("segments")
+            if seg_snapshot is None or seg_snapshot["segment_num"] != int(self.ss_seg.segment_num[None]):
+                n_seg = int(self.ss_seg.segment_num[None])
+                seg_snapshot = {
+                    "segment_num": n_seg,
+                    "x_minus": self.ss_seg.x_minus.to_numpy()[:n_seg].copy(),
+                    "x_plus": self.ss_seg.x_plus.to_numpy()[:n_seg].copy(),
+                    "gamma": self.ss_seg.gamma.to_numpy()[:n_seg].copy(),
+                    "active": self.ss_seg.active.to_numpy()[:n_seg].copy(),
+                    "seg_type": self.ss_seg.seg_type.to_numpy()[:n_seg].copy(),
+                }
+                snapshot["segments"] = seg_snapshot
+            else:
+                n_seg = seg_snapshot["segment_num"]
             fig2, ax2 = plt.subplots(figsize=(10, 2.5), dpi=200)
             pad = float(self.seg_cfg.get_cfg("imageSegmentAxisPad", 0.02))
             hide_solid = bool(self.seg_cfg.get_cfg("imageSegmentPanelHideSolid", False))
@@ -3551,11 +3896,11 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
                     s=0.6, edgecolors="none", zorder=1, alpha=0.55,
                 )
             if n_seg > 0:
-                xm = self.ss_seg.x_minus.to_numpy()[:n_seg]
-                xp = self.ss_seg.x_plus.to_numpy()[:n_seg]
-                idx_int, idx_bnd = self._active_segment_index_groups(n_seg)
+                xm = seg_snapshot["x_minus"]
+                xp = seg_snapshot["x_plus"]
+                idx_int, idx_bnd = self._active_segment_index_groups(n_seg, seg_snapshot)
                 if idx_int.size > 0:
-                    gamma_values = self.ss_seg.gamma.to_numpy()[:n_seg]
+                    gamma_values = seg_snapshot["gamma"]
                     scalars = gamma_values[idx_int].astype(np.float64)
                     seg_norm = self._segment_gamma_color_norm(scalars)
                     if getattr(self.seg_solver, "_bs_2d_point", False):
@@ -3596,7 +3941,8 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
             ax2.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
             seg_transparent = not (seg_only_bg and hide_solid)
-            plt.savefig(
+            self._save_png_resilient(
+                fig2,
                 dir_seg / f"vorticity_{cnt:04}.png",
                 bbox_inches="tight",
                 pad_inches=0.02,
@@ -3610,4 +3956,6 @@ class DFSPHSegmentHybridKarmanSolver(DFSPHKarmanVortexSolver):
         """导出 SPH 粒子 PLY（父类），并在同一目录写入涡段 ``segments_{cnt:04}.ply``。"""
         super().export_ply(cnt, ply_path)
         if self._export_segment_ply:
-            self._segment_exporter.export_segments_ply(cnt, ply_path)
+            self._segment_exporter.export_segments_ply(
+                cnt, ply_path, snapshot=self._get_export_snapshot().get("segments")
+            )

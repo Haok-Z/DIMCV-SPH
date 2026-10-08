@@ -27,6 +27,24 @@ class FlowStatisticsRecorder:
         "kinetic_energy_mean_per_particle",
         "vortex_kinetic_energy_total",
         "vortex_kinetic_energy_mean_per_particle",
+        "micro_angular_energy_total",
+        "micro_omega_mean_magnitude",
+        "micro_omega_max_magnitude",
+    ]
+    particle_fieldnames = [
+        "frame",
+        "time",
+        "particle_id",
+        "vorticity_field",
+        "vorticity_x",
+        "vorticity_y",
+        "vorticity_z",
+        "vorticity_magnitude",
+        "kinetic_energy",
+        "micro_omega_x",
+        "micro_omega_y",
+        "micro_omega_z",
+        "micro_omega_magnitude",
     ]
 
     def __init__(self, output_dir: Path, config, method_name: str):
@@ -37,9 +55,17 @@ class FlowStatisticsRecorder:
         self.field_name = str(config.get_cfg("statisticsVorticityField") or "raw").lower()
         filename = str(config.get_cfg("statisticsOutputName") or "flow_statistics.csv")
         self.path = output_dir / filename
+        export_particles = config.get_cfg("statisticsParticleExportEnabled")
+        self.export_particles = bool(export_particles) if export_particles is not None else True
+        particle_filename = str(
+            config.get_cfg("statisticsParticleOutputName") or "flow_vorticity_particles.csv"
+        )
+        self.particle_path = output_dir / particle_filename
         self.method_name = method_name
         self._file = None
         self._writer = None
+        self._particle_file = None
+        self._particle_writer = None
 
         if self.enabled:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -48,6 +74,12 @@ class FlowStatisticsRecorder:
             self._writer.writeheader()
             self._file.flush()
             print(f"[{method_name}] statistics output: {self.path}")
+            if self.export_particles:
+                self._particle_file = self.particle_path.open("w", newline="", encoding="utf-8")
+                self._particle_writer = csv.writer(self._particle_file)
+                self._particle_writer.writerow(self.particle_fieldnames)
+                self._particle_file.flush()
+                print(f"[{method_name}] particle statistics output: {self.particle_path}")
 
     def record(self, solver, frame: int, simulation_time: float):
         if not self.enabled:
@@ -65,6 +97,11 @@ class FlowStatisticsRecorder:
 
         velocity = solver.ps.v.to_numpy()[:n, : int(solver.ps.dim)].astype(np.float64, copy=False)
         mass = solver.ps.m.to_numpy()[:n].astype(np.float64, copy=False)
+        micro = getattr(solver.ps, "micro_omega", None)
+        if micro is not None:
+            micro = micro.to_numpy()[:n].astype(np.float64, copy=False)
+        else:
+            micro = np.zeros((n, 3), dtype=np.float64)
         omega_field = solver.ps.vorticity_vis if self.field_name in ("vis", "smoothed", "vorticity_vis") else solver.ps.vorticity
         omega = omega_field.to_numpy()[:n].astype(np.float64, copy=False)
 
@@ -77,6 +114,30 @@ class FlowStatisticsRecorder:
         magnitudes = omega_magnitude[selected]
         particle_ke = 0.5 * m * np.einsum("ij,ij->i", v, v)
         vortex_particle_ke = particle_ke[selected]
+
+        if self._particle_writer is not None:
+            particle_ids = np.flatnonzero(fluid)
+            self._particle_writer.writerows(
+                (
+                    int(frame),
+                    float(simulation_time),
+                    int(particle_id),
+                    "vorticity_vis" if omega_field is solver.ps.vorticity_vis else "vorticity",
+                    float(vorticity[0]),
+                    float(vorticity[1]),
+                    float(vorticity[2]),
+                    float(magnitude),
+                    float(kinetic_energy),
+                    float(micro[particle_id, 0]),
+                    float(micro[particle_id, 1]),
+                    float(micro[particle_id, 2]),
+                    float(np.linalg.norm(micro[particle_id])),
+                )
+                for particle_id, vorticity, magnitude, kinetic_energy in zip(
+                    particle_ids, w, omega_magnitude, particle_ke
+                )
+            )
+            self._particle_file.flush()
 
         row = {
             "frame": int(frame),
@@ -94,6 +155,9 @@ class FlowStatisticsRecorder:
             "kinetic_energy_mean_per_particle": float(np.mean(particle_ke)) if particle_ke.size else 0.0,
             "vortex_kinetic_energy_total": float(np.sum(vortex_particle_ke)),
             "vortex_kinetic_energy_mean_per_particle": float(np.mean(vortex_particle_ke)) if vortex_particle_ke.size else 0.0,
+            "micro_angular_energy_total": float(0.5 * np.sum(m * np.einsum("ij,ij->i", micro[fluid], micro[fluid]))) if fluid_count else 0.0,
+            "micro_omega_mean_magnitude": float(np.mean(np.linalg.norm(micro[fluid], axis=1))) if fluid_count else 0.0,
+            "micro_omega_max_magnitude": float(np.max(np.linalg.norm(micro[fluid], axis=1))) if fluid_count else 0.0,
         }
         self._writer.writerow(row)
         self._file.flush()
@@ -102,3 +166,6 @@ class FlowStatisticsRecorder:
         if self._file is not None:
             self._file.close()
             self._file = None
+        if self._particle_file is not None:
+            self._particle_file.close()
+            self._particle_file = None

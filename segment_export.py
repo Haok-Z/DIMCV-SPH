@@ -260,7 +260,7 @@ class SegmentExporter:
             rgb = rgb / 255.0
         return np.clip(rgb, 0.0, 1.0)
 
-    def export_segments_ply(self, frame_id: int, out_dir: Path):
+    def export_segments_ply(self, frame_id: int, out_dir: Path, snapshot=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"segments_{frame_id:04}.ply"
 
@@ -268,16 +268,26 @@ class SegmentExporter:
         blocks = self.ss.cfg.get_obstacles() if hasattr(self.ss.cfg, "get_obstacles") else []
         cyls = self.ss.cfg.get_cylinders() if hasattr(self.ss.cfg, "get_cylinders") else []
 
-        n = int(self.ss.segment_num[None])
+        if snapshot is None:
+            n = int(self.ss.segment_num[None])
+            snapshot = {
+                "segment_num": n,
+                "x_minus": self.ss.x_minus.to_numpy()[:n],
+                "x_plus": self.ss.x_plus.to_numpy()[:n],
+                "gamma": self.ss.gamma.to_numpy()[:n],
+                "active": self.ss.active.to_numpy()[:n],
+                "seg_type": self.ss.seg_type.to_numpy()[:n],
+            }
+        n = int(snapshot["segment_num"])
         conv = str(self.ss.cfg.get_cfg("exportPLYAxisConvention", "y_up"))
 
         pts = []
         if n > 0:
-            x_minus = self.ss.x_minus.to_numpy()[:n]
-            x_plus = self.ss.x_plus.to_numpy()[:n]
-            gamma = self.ss.gamma.to_numpy()[:n]
-            active = self.ss.active.to_numpy()[:n].astype(bool)
-            seg_type = self.ss.seg_type.to_numpy()[:n]
+            x_minus = snapshot["x_minus"]
+            x_plus = snapshot["x_plus"]
+            gamma = snapshot["gamma"]
+            active = snapshot["active"].astype(bool)
+            seg_type = snapshot["seg_type"]
             for i in range(n):
                 if not active[i]:
                     continue
@@ -300,7 +310,7 @@ class SegmentExporter:
         if len(pts) == 0:
             return
 
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", buffering=1024 * 1024) as f:
             f.write("ply\n")
             f.write("format ascii 1.0\n")
             f.write(f"element vertex {len(pts)}\n")
@@ -313,19 +323,26 @@ class SegmentExporter:
             if include_solids:
                 f.write("property uchar vertex_kind\n")
             f.write("end_header\n")
+            rows = []
+            chunk_size = 4096
             for row in pts:
                 if include_solids:
                     p, g, t, e, vk = row
-                    f.write(
+                    rows.append(
                         f"{float(p[0]):.7f} {float(p[1]):.7f} {float(p[2]):.7f} "
                         f"{g:.7f} {int(t)} {int(e)} {int(vk)}\n"
                     )
                 else:
                     p, g, t, e = row
-                    f.write(
+                    rows.append(
                         f"{float(p[0]):.7f} {float(p[1]):.7f} {float(p[2]):.7f} "
                         f"{g:.7f} {int(t)} {int(e)}\n"
                     )
+                if len(rows) >= chunk_size:
+                    f.write("".join(rows))
+                    rows.clear()
+            if rows:
+                f.write("".join(rows))
 
     def export_segments_png(self, frame_id: int, out_dir: Path):
         out_dir.mkdir(parents=True, exist_ok=True)

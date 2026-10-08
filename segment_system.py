@@ -29,6 +29,7 @@ class SegmentSystem:
 
         self.center = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
         self.tangent = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
+        self.delta = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
         self.length = ti.field(dtype=float, shape=self.segment_max_num)
         # 固定段心/段长对流时，在初始化末快照的参考几何
         self.center_ref = ti.Vector.field(self.dim, dtype=float, shape=self.segment_max_num)
@@ -67,6 +68,7 @@ class SegmentSystem:
             if self.active[i] == 1:
                 d = self.x_plus[i] - self.x_minus[i]
                 l = d.norm() + 1e-8
+                self.delta[i] = d
                 self.center[i] = 0.5 * (self.x_plus[i] + self.x_minus[i])
                 self.tangent[i] = d / l
                 self.length[i] = l

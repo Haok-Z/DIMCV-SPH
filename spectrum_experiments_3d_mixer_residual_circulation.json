@@ -1,0 +1,21 @@
+{
+  "sampleInterval": 0.25,
+  "cases": {
+    "mixer_residual_circulation": {
+      "scenes": {
+        "dimcv": "data/scenes/DIM_von_karman_vortex_3d_dimcv_rotating_mixer_unified_coarse.json",
+        "dfsph": "data/scenes/DIM_von_karman_vortex_3d_dfsph_rotating_mixer_unified_coarse.json",
+        "dfsph_segment": "data/scenes/DIM_von_karman_vortex_3d_dfsph_segment_rotating_mixer_unified_coarse_residual_circulation.json"
+      },
+      "maxTimeError": 0.02,
+      "gridSpacings": [0.025, 0.0125],
+      "regions": {
+        "mixing_roi": {"start": [0.95, 0.1, 0.04], "end": [3.0, 0.9, 0.5]}
+      },
+      "stages": {
+        "driven": [[2.0, 4.0], [6.0, 8.0], [10.0, 12.0]],
+        "coast": [[4.0, 6.0], [8.0, 10.0]]
+      }
+    }
+  }
+}

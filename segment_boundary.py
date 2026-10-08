@@ -29,6 +29,21 @@ def _cfg_use_2d_point_vortex_bs(cfg, spatial_dim: int) -> bool:
 class SegmentBoundaryHandler:
     def __init__(self, segment_system):
         self.ss = segment_system
+        convention = str(
+            self.ss.cfg.get_cfg("segmentStrengthConvention", "paper_circulation")
+            or "paper_circulation"
+        ).lower().strip()
+        if convention not in (
+            "paper_circulation",
+            "legacy_mixed",
+            "residual_circulation",
+        ):
+            raise ValueError(
+                "segmentStrengthConvention must be 'paper_circulation', "
+                "'legacy_mixed', or 'residual_circulation'"
+            )
+        self.segment_strength_convention = convention
+        self._paper_circulation = convention != "legacy_mixed"
         self.enable_boundary_injection = bool(
             self.ss.cfg.get_cfg("enableBoundaryInjection", False)
         )
@@ -115,6 +130,8 @@ class SegmentBoundaryHandler:
         self._gpu_boundary_gamma = ti.field(dtype=ti.f32, shape=self._gpu_boundary_cap_ng)
         self._gpu_boundary_projection_ready = False
         self._gpu_boundary_samples_synced = False
+        self._use_paper_circulation = ti.field(dtype=ti.i32, shape=())
+        self._use_paper_circulation[None] = 0 if convention == "legacy_mixed" else 1
 
         self._use_2d_point_bs = _cfg_use_2d_point_vortex_bs(self.ss.cfg, int(self.ss.dim))
 
@@ -381,7 +398,6 @@ class SegmentBoundaryHandler:
         v = self.ss.cfg.get_cfg("backgroundVelocity", [0.0, 0.0, 0.0])
         return np.array(v, dtype=np.float32)
 
-    @staticmethod
     def _bs_velocity_finite_line(
         query: np.ndarray,
         x_minus: np.ndarray,
@@ -391,13 +407,13 @@ class SegmentBoundaryHandler:
     ) -> np.ndarray:
         """
         论文 TOG2021 式 (6)（与 segment_solver 有限段 BS 一致）。
-        Γ = gamma_seg * L；分母正则为 ||(x^−−x)×(x^+−x)||^2 + R^2。
+        paper_circulation 下 gamma_seg 就是 Γ；legacy_mixed 下仍乘 L。
         """
         am = x_minus.astype(np.float32, copy=False)
         ap = x_plus.astype(np.float32, copy=False)
         dvec = ap - am
         L = float(np.linalg.norm(dvec)) + 1e-8
-        Gamma = float(gamma_seg) * L
+        Gamma = float(gamma_seg) if self._paper_circulation else float(gamma_seg) * L
         R2 = np.float32(reg_radius * reg_radius)
         apx = ap[None, :] - query
         ambx = am[None, :] - query
@@ -449,7 +465,7 @@ class SegmentBoundaryHandler:
                 qxy = query[:, :2].astype(np.float32, copy=False)
             else:
                 qxy = query.astype(np.float32, copy=False)
-            Gamma = float(gamma_seg) * L
+            Gamma = float(gamma_seg) if self._paper_circulation else float(gamma_seg) * L
             return self._bs_velocity_2d_point_vortex(
                 qxy, c[:2].astype(np.float32, copy=False), Gamma, reg_radius
             )
@@ -1446,7 +1462,9 @@ class SegmentBoundaryHandler:
                     ap = self.ss.x_plus[j]
                     c = 0.5 * (am + ap)
                     L = (ap - am).norm() + 1e-8
-                    Gamma = self.ss.gamma[j] * L
+                    Gamma = self.ss.gamma[j]
+                    if self._use_paper_circulation[None] == 0:
+                        Gamma *= L
                     r = ti.Vector([b[0] - c[0], b[1] - c[1], 0.0])
                     r2 = r[0] * r[0] + r[1] * r[1] + R2
                     denom = r2 + 1e-12

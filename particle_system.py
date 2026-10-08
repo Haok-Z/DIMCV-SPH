@@ -6,6 +6,7 @@ from config_builder import SimConfig
 from karman_vortex import KarmanVortexSolver
 from dfsph_karman_solver import DFSPHKarmanVortexSolver
 from dfsph_segment_hybrid_solver import DFSPHSegmentHybridKarmanSolver
+from mpsph_solver import MPSPHKarmanSolver
 
 
 @ti.data_oriented
@@ -69,6 +70,8 @@ class ParticleSystem:
         self.particle_num[None] = 0
         self.active_particle_num = ti.field(int, shape=())
         self.active_particle_num[None] = 0
+        self.has_inactive_particles = ti.field(dtype=ti.i32, shape=())
+        self.has_inactive_particles[None] = 0
 
         # Grid related properties
         self.grid_size = self.support_radius
@@ -189,6 +192,8 @@ class ParticleSystem:
         self.vorticity_vis = ti.Vector.field(3,
                                              dtype=float,
                                              shape=self.particle_max_num)
+        self.micro_omega = ti.Vector.field(3, dtype=float,
+                                           shape=self.particle_max_num)
         self.dfsph_factor = ti.field(dtype=float, shape=self.particle_max_num)
         self.density_adv = ti.field(dtype=float, shape=self.particle_max_num)
         self.is_active = ti.field(dtype=bool, shape=self.particle_max_num)
@@ -235,6 +240,8 @@ class ParticleSystem:
                                          shape=self.particle_max_num)
         self.life_time_buffer = ti.field(dtype=float,
                                          shape=self.particle_max_num)
+        self.micro_omega_buffer = ti.Vector.field(3, dtype=float,
+                                                  shape=self.particle_max_num)
 
         # Grid id for each particle
         self.grid_ids = ti.field(int, shape=self.particle_max_num)
@@ -336,9 +343,11 @@ class ParticleSystem:
             return DFSPHKarmanVortexSolver(self)
         if self.simulation_method == 2:
             return DFSPHSegmentHybridKarmanSolver(self)
+        if self.simulation_method == 3:
+            return MPSPHKarmanSolver(self)
         raise NotImplementedError(
             f"simulationMethod {self.simulation_method} is not implemented "
-            "(use 0 DIMCV+DFSPH, 1 DFSPH-only, 2 DFSPH+segments)."
+            "(use 0 DIMCV+DFSPH, 1 DFSPH-only, 2 DFSPH+segments, 3 MPSPH)."
         )
 
     @ti.func
@@ -355,6 +364,7 @@ class ParticleSystem:
         self.material[p] = material
         self.is_dynamic[p] = is_dynamic
         self.color[p] = color
+        self.micro_omega[p] = ti.Vector([0.0, 0.0, 0.0])
         self.is_active[p] = 1
         if material == self.material_fluid:
             self.fluid_particle_num[None] += 1
@@ -446,10 +456,13 @@ class ParticleSystem:
 
     @ti.kernel
     def update_activity(self):
+        self.has_inactive_particles[None] = 0
         for i in range(self.particle_num[None]):
             if self.material[i] == self.material_solid:
                 # A solver may intentionally deactivate a legacy proxy
                 # particle. Do not silently revive it during compaction.
+                if self.is_active[i] != 1:
+                    self.has_inactive_particles[None] = 1
                 continue
             elif self.material[i] == self.material_fluid:
                 if self._cull_fluid_domain[None] != 1:
@@ -463,6 +476,7 @@ class ParticleSystem:
                         out = 1
                 if out == 1:
                     self.is_active[i] = 0
+                    self.has_inactive_particles[None] = 1
                     self.fluid_particle_num[None] -= 1
                     obj_id = self.object_id[i]
                     if ti.static(self.num_emitters > 0):
@@ -481,6 +495,7 @@ class ParticleSystem:
                 self.x_buffer[new_idx_temp] = self.x[i]
                 self.v_buffer[new_idx_temp] = self.v[i]
                 self.vorticity_buffer[new_idx_temp] = self.vorticity[i]
+                self.micro_omega_buffer[new_idx_temp] = self.micro_omega[i]
                 self.acceleration_buffer[new_idx_temp] = self.acceleration[i]
                 self.m_V_buffer[new_idx_temp] = self.m_V[i]
                 self.m_buffer[new_idx_temp] = self.m[i]
@@ -518,6 +533,7 @@ class ParticleSystem:
             self.v[i] = self.v_buffer[i]
             self.acceleration[i] = self.acceleration_buffer[i]
             self.vorticity[i] = self.vorticity_buffer[i]
+            self.micro_omega[i] = self.micro_omega_buffer[i]
             self.m_V[i] = self.m_V_buffer[i]
             self.m[i] = self.m_buffer[i]
             self.density[i] = self.density_buffer[i]
@@ -562,6 +578,7 @@ class ParticleSystem:
             self.v_buffer[new_index] = self.v[I]
             self.acceleration_buffer[new_index] = self.acceleration[I]
             self.vorticity_buffer[new_index] = self.vorticity[I]
+            self.micro_omega_buffer[new_index] = self.micro_omega[I]
             self.m_V_buffer[new_index] = self.m_V[I]
             self.m_buffer[new_index] = self.m[I]
             self.density_buffer[new_index] = self.density[I]
@@ -583,6 +600,7 @@ class ParticleSystem:
             self.v[I] = self.v_buffer[I]
             self.acceleration[I] = self.acceleration_buffer[I]
             self.vorticity[I] = self.vorticity_buffer[I]
+            self.micro_omega[I] = self.micro_omega_buffer[I]
             self.m_V[I] = self.m_V_buffer[I]
             self.m[I] = self.m_buffer[I]
             self.density[I] = self.density_buffer[I]
@@ -604,7 +622,8 @@ class ParticleSystem:
 
     def initialize_particle_system(self):
         self.update_activity()
-        self.particle_partition()
+        if self.has_inactive_particles[None] == 1:
+            self.particle_partition()
         self.rebuild_neighbor_grid()
 
     @ti.func

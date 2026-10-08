@@ -11,6 +11,7 @@ class KarmanVortexSolver(DIMCVSPHSolver):
 
     def __init__(self, particle_system):
         super().__init__(particle_system)
+        self._export_snapshot = None
         cfg_dict = getattr(self.ps.cfg, "config", {}).get("Configuration", {})
 
         def cfg_get(name, default=None):
@@ -424,10 +425,33 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             float(angular_velocity),
         )
 
+    def capture_export_snapshot(self):
+        """Read the particle fields once for all exporters of the current frame."""
+        n = int(self.ps.particle_num[None])
+        snapshot = {
+            "particle_num": n,
+            "material": self.ps.material.to_numpy()[:n].copy(),
+            "object_id": self.ps.object_id.to_numpy()[:n].copy(),
+            "x": self.x_temp.to_numpy()[:n].copy(),
+            "vorticity_vis": self.ps.vorticity_vis.to_numpy()[:n].copy(),
+            "v": self.ps.v.to_numpy()[:n].copy(),
+            "vorticity": self.ps.vorticity.to_numpy()[:n].copy(),
+            "color": self.ps.color.to_numpy()[:n].copy(),
+            "is_active": self.ps.is_active.to_numpy()[:n].copy(),
+        }
+        self._export_snapshot = snapshot
+        return snapshot
+
+    def _get_export_snapshot(self):
+        snapshot = self._export_snapshot
+        if snapshot is None or snapshot["particle_num"] != int(self.ps.particle_num[None]):
+            snapshot = self.capture_export_snapshot()
+        return snapshot
+
     def export_png(self, cnt, image_path):
-        N = self.ps.particle_num[None]
-        material = self.ps.material.to_numpy()[:N]
-        obj_id = self.ps.object_id.to_numpy()[:N]
+        snapshot = self._get_export_snapshot()
+        material = snapshot["material"]
+        obj_id = snapshot["object_id"]
         fluid_mask = (material == self.ps.material_fluid)
         # Render the channel walls/cylinder unless the scene hides an object id.
         invisible_objects = self.ps.cfg.get_cfg("invisibleObjects") or []
@@ -436,8 +460,8 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         if invisible_ids.size > 0:
             solid_mask &= ~np.isin(obj_id, invisible_ids)
 
-        x = self.x_temp.to_numpy()[:N]
-        vort_np = self.ps.vorticity_vis.to_numpy()[:N]
+        x = snapshot["x"]
+        vort_np = snapshot["vorticity_vis"]
         vort = vort_np[:, 2] if vort_np.shape[1] > 2 else vort_np[:, 0]
 
         fluid_x = x[fluid_mask]
@@ -571,7 +595,8 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         """
         Export current particles to an ASCII PLY file with:
         - position (x, y, z)
-        - vorticity (vort_x, vort_y, vort_z)
+        - final velocity (vel_x, vel_y, vel_z)
+        - raw SPH vorticity (vort_x, vort_y, vort_z)
         - color (r, g, b)
         - object_id
         - particle_type:
@@ -585,19 +610,22 @@ class KarmanVortexSolver(DIMCVSPHSolver):
         ``y_up`` / ``same`` / ``sim`` (no change), or ``z_up`` / ``houdini``
         maps (x,y,z) and vorticity as (x,z,y).
         """
-        N = self.ps.particle_num[None]
+        snapshot = self._get_export_snapshot()
+        N = snapshot["particle_num"]
         if N == 0:
             return
 
-        x = self.x_temp.to_numpy()[:N]
-        vorticity = self.ps.vorticity.to_numpy()[:N]
-        color = self.ps.color.to_numpy()[:N]
-        obj_id = self.ps.object_id.to_numpy()[:N]
-        material = self.ps.material.to_numpy()[:N]
-        is_active = self.ps.is_active.to_numpy()[:N].astype(bool)
+        x = snapshot["x"]
+        velocity = snapshot["v"]
+        vorticity = snapshot["vorticity"]
+        color = snapshot["color"]
+        obj_id = snapshot["object_id"]
+        material = snapshot["material"]
+        is_active = snapshot["is_active"].astype(bool)
 
         # Only keep active particles
         x = x[is_active]
+        velocity = velocity[is_active]
         vorticity = vorticity[is_active]
         color = color[is_active]
         obj_id = obj_id[is_active]
@@ -634,11 +662,23 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             self.ps.cfg.get_cfg("exportPLYAxisConvention", "y_up") or "y_up"
         )
 
+        # Hybrid solvers can provide extra velocity fields using the same
+        # active-particle ordering as ps.v.  The base solver deliberately
+        # knows nothing about their physical interpretation.
+        extra_vectors = {}
+        provider = getattr(self, "ply_extra_vector_fields", None)
+        if provider is not None:
+            for name, values in provider(N).items():
+                values = np.asarray(values)[:N]
+                if values.shape != (N, 3):
+                    raise ValueError(f"PLY extra vector {name!r} must have shape ({N}, 3)")
+                extra_vectors[name] = values[is_active]
+
         # Ensure output directory exists
         ply_path.mkdir(parents=True, exist_ok=True)
         file_path = ply_path / f"frame_{cnt:04}.ply"
 
-        with open(file_path, "w") as f:
+        with open(file_path, "w", buffering=1024 * 1024) as f:
             # PLY header
             f.write("ply\n")
             f.write("format ascii 1.0\n")
@@ -654,26 +694,54 @@ class KarmanVortexSolver(DIMCVSPHSolver):
             f.write("property uchar blue\n")
             f.write("property int object_id\n")
             f.write("property uchar particle_type\n")
+            # New columns are appended so older positional PLY consumers keep
+            # seeing their original first eleven attributes unchanged.
+            f.write("property float vel_x\n")
+            f.write("property float vel_y\n")
+            f.write("property float vel_z\n")
+            for name in extra_vectors:
+                f.write(f"property float {name}_x\n")
+                f.write(f"property float {name}_y\n")
+                f.write(f"property float {name}_z\n")
             f.write("end_header\n")
 
             # Data rows (axis convention for DCC: same rules as segment PLY)
+            rows = []
+            chunk_size = 4096
             for i in range(num_vertices):
                 p = SegmentExporter._apply_ply_axis_convention(x[i], ply_axis_conv)
                 w = SegmentExporter._apply_ply_axis_convention(
                     np.asarray(vorticity[i], dtype=np.float64), ply_axis_conv
+                )
+                u = SegmentExporter._apply_ply_axis_convention(
+                    np.asarray(velocity[i], dtype=np.float64), ply_axis_conv
                 )
                 px, py, pz = float(p[0]), float(p[1]), float(p[2])
                 vx, vy, vz = float(w[0]), float(w[1]), float(w[2])
                 r, g, b = color[i]
                 oid = int(obj_id[i])
                 ptype = int(particle_type[i])
-                f.write(
+                row = (
                     f"{px:.7f} {py:.7f} {pz:.7f} "
                     f"{vx:.7f} {vy:.7f} {vz:.7f} "
-                    f"{int(r)} {int(g)} {int(b)} {oid} {ptype}\n"
+                    f"{int(r)} {int(g)} {int(b)} {oid} {ptype} "
+                    f"{float(u[0]):.7f} {float(u[1]):.7f} {float(u[2]):.7f}"
                 )
+                for values in extra_vectors.values():
+                    extra = SegmentExporter._apply_ply_axis_convention(
+                        np.asarray(values[i], dtype=np.float64), ply_axis_conv
+                    )
+                    row += f" {float(extra[0]):.7f} {float(extra[1]):.7f} {float(extra[2]):.7f}"
+                rows.append(row + "\n")
+                if len(rows) >= chunk_size:
+                    f.write("".join(rows))
+                    rows.clear()
+            if rows:
+                f.write("".join(rows))
 
     def step(self):
+        # Export snapshots are valid only until the next simulation step.
+        self._export_snapshot = None
         # Cull out-of-domain fluid and compact first so emit sees freed slots.
         self.ps.initialize_particle_system()
         if self._cylinder_oscillation_enabled:
